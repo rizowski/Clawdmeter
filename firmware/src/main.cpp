@@ -213,6 +213,12 @@ void setup() {
 
     buf1 = (uint16_t*)heap_caps_malloc(W * BUF_LINES * 2, LV_BUF_CAPS);
     buf2 = (uint16_t*)heap_caps_malloc(W * BUF_LINES * 2, LV_BUF_CAPS);
+    if (!buf1 || !buf2) {
+        // LVGL would fault on the first render; say why instead.
+        Serial.printf("FATAL: LVGL draw buffers alloc failed (%u bytes each)\n",
+                      (unsigned)(W * BUF_LINES * 2));
+        while (true) delay(1000);
+    }
 
     lv_display_t* disp = lv_display_create(W, H);
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);

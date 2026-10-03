@@ -46,25 +46,27 @@ static bool active = false;
 // rate-driven group every this many ms.
 #define SPLASH_ROTATE_INTERVAL_MS 20000
 
-// Usage-rate animation groups: 4 groups × up to 4 animations each.
+// Usage-rate animation groups: 4 groups × up to 5 animations each.
 // Filled at init by matching literal names from splash_anims[].
 // (jumping is the only unassigned animation — still reachable via splash_next.)
 #define GROUP_COUNT 4
-#define GROUP_MAX   4
+#define GROUP_MAX   5
 static int8_t  group_lists[GROUP_COUNT][GROUP_MAX];
 static uint8_t group_size[GROUP_COUNT] = {0};
 static uint8_t group_rotation[GROUP_COUNT] = {0};
 
 static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
-    // Group 0 — idle / sleepy (calm, investigative). Magnifier first: it's
-    // the boot pick, and lurking-first would boot to a near-empty screen.
-    { "magnifier", "walking", "pointing", "lurking" },
+    // Group 0 — idle / sleepy (calm, investigative, plus the fan-made
+    // cookie snack). Magnifier first: it's the boot pick, and lurking-first
+    // would boot to a near-empty screen.
+    { "magnifier", "walking", "pointing", "lurking", "eating" },
     // Group 1 — normal pace
     { "crab walking", "waving", "trumpet", "basketball" },
     // Group 2 — active (typing along with you)
     { "laptop", "dancing", "skateboard", "soccer" },
-    // Group 3 — heavy burn (high-energy rides + the most exuberant jump)
-    { "racing car", "cloud", "sailing scene", "jumping happy" },
+    // Group 3 — heavy burn (high-energy rides + the most exuberant jump,
+    // plus the fan-made baking scene)
+    { "racing car", "cloud", "sailing scene", "jumping happy", "baking" },
 };
 
 // Scratch stage: the current animation frame composed centered onto the full

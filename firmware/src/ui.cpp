@@ -6,6 +6,7 @@
 #include "clawd_still.h"
 #include "icons.h"
 #include "hal/board_caps.h"
+#include "usage_rate.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -31,11 +32,15 @@ struct Layout {
     int16_t content_y;
     int16_t content_w;
 
-    // Usage screen
-    int16_t usage_panel_h;
-    int16_t usage_panel_gap;
-    int16_t usage_bar_y;
-    int16_t usage_reset_y;
+    // Usage screen — top row (Current + Status, side by side) and a
+    // full-width bottom row (Weekly), so the two heights/offsets diverge.
+    int16_t usage_top_h;
+    int16_t usage_bottom_h;
+    int16_t usage_panel_gap;      // gap between top tiles, and between rows
+    int16_t usage_top_bar_y;
+    int16_t usage_top_reset_y;
+    int16_t usage_bottom_bar_y;
+    int16_t usage_bottom_reset_y;
     int16_t bar_h;
     int16_t panel_pad_x, panel_pad_y;
     int16_t pill_pad_x, pill_pad_y;
@@ -106,10 +111,13 @@ static void compute_layout(const BoardCaps& c) {
     if (c.height >= 460) {
         // Large layout — tuned for 480x480 (AMOLED-2.16).
         L.content_y = 100;
-        L.usage_panel_h = 150;
+        L.usage_top_h = 130;
+        L.usage_bottom_h = 170;
         L.usage_panel_gap = 16;
-        L.usage_bar_y = 56;
-        L.usage_reset_y = 94;
+        L.usage_top_bar_y = 47;
+        L.usage_top_reset_y = 78;
+        L.usage_bottom_bar_y = 65;
+        L.usage_bottom_reset_y = 109;
         L.bt_info_panel_h = 160;
         L.bt_reset_zone_h = 110;
         L.bt_title_font    = &font_tiempos_56;
@@ -120,12 +128,22 @@ static void compute_layout(const BoardCaps& c) {
     } else if (c.height >= 300) {
         // Compact layout — tuned for 368x448 (AMOLED-1.8).
         L.content_y = 85;
-        L.usage_panel_h = 130;
+        // Same fonts as large, so the top tile needs large's vertical rhythm:
+        // styrene_48 digits end at y 40, bar (+4 px marker) from 47, reset row
+        // (styrene_28, 30 px) from 78 → 108 + 2×12 padding.
+        L.usage_top_h = 132;
+        L.usage_bottom_h = 160;
         L.usage_panel_gap = 12;
-        L.usage_bar_y = 48;
-        L.usage_reset_y = 78;
+        L.usage_top_bar_y = 47;
+        L.usage_top_reset_y = 78;
+        L.usage_bottom_bar_y = 62;
+        L.usage_bottom_reset_y = 100;
         L.bt_info_panel_h = 140;
         L.bt_reset_zone_h = 90;
+        // 368 px is too narrow for styrene_28 rows: "On pace - Resets Aug 15"
+        // clipped and the elapsed "/75%" ran into the pill.
+        L.pill_font  = &font_styrene_24;
+        L.reset_font = &font_styrene_24;
         L.bt_title_font    = &font_tiempos_34;
         L.bt_status_font   = &font_styrene_28;
         L.bt_device_font   = &font_styrene_20;
@@ -138,10 +156,15 @@ static void compute_layout(const BoardCaps& c) {
         L.margin = 8;
         L.title_y = 4;
         L.content_y = 44;
-        L.usage_panel_h = 74;
+        // Top tile stacks pct (styrene_24, 25 px) → bar (12 px, marker
+        // overhangs 4 px each side) → reset/rate row (14 px), no overlap.
+        L.usage_top_h = 68;
+        L.usage_bottom_h = 92;
         L.usage_panel_gap = 6;
-        L.usage_bar_y = 30;
-        L.usage_reset_y = 46;
+        L.usage_top_bar_y = 24;
+        L.usage_top_reset_y = 41;
+        L.usage_bottom_bar_y = 39;
+        L.usage_bottom_reset_y = 59;
         L.bar_h = 12;
         L.panel_pad_x = 10;
         L.panel_pad_y = 6;
@@ -149,7 +172,9 @@ static void compute_layout(const BoardCaps& c) {
         L.pill_pad_y = 2;
         L.title_font   = &font_tiempos_34;
         L.pct_font     = &font_styrene_24;
-        L.ent_pct_font = &font_tiempos_34;
+        // Tiempos 34's digits reach y 28 and would sit on the bar at y 24;
+        // Styrene 24 (the normal pct font) clears it.
+        L.ent_pct_font = &font_styrene_24;
         L.pill_font    = &font_styrene_14;
         L.reset_font   = &font_styrene_14;
         L.pace_font    = &font_styrene_12;
@@ -211,10 +236,50 @@ static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
 static lv_obj_t* panel_session = nullptr;
 static lv_obj_t* panel_weekly = nullptr;
+static lv_obj_t* lbl_rate = nullptr;         // "Active 0.25 %/min", in the Current tile
+
+// Dim "/62%" — how far into the window you are, as a number. The tick on the
+// bar is the same value; the statusline shows only the number, so show both.
+static lv_obj_t* lbl_session_elapsed = nullptr;
+static lv_obj_t* lbl_weekly_elapsed = nullptr;
+
+// Pace markers — a tick on each bar at the "you should be here" position.
+static lv_obj_t* marker_session = nullptr;
+static lv_obj_t* marker_weekly = nullptr;
+static int       bar_session_w = 0;   // inner bar widths, cached for marker math
+static int       bar_weekly_w = 0;
+
+// Window lengths are Anthropic product constants, not fields in the BLE
+// payload — the daemon only sends the countdown to the next reset.
+#define SESSION_WINDOW_MINS   300     // 5h
+#define WEEKLY_WINDOW_MINS   10080    // 7d
+
+// Rainbow mode — mirrors ~/bin/claude-statusline: each window rainbows
+// independently through its own final stretch, stepping one fixed color per
+// second rather than sweeping hue. Text gets a per-character gradient, the
+// same shape the script draws with ANSI codes.
+#define RAINBOW_5H_MINS     60      // 5h window: last hour  (script: near=3600s)
+#define RAINBOW_7D_MINS     1440    // 7d window: last day   (script: near=86400s)
+#define RB_COUNT            6
+// ANSI bright red, yellow, green, cyan, blue, magenta — the script's order.
+static const uint32_t RB_COLORS[RB_COUNT] = {
+    0xff5555, 0xffff55, 0x55ff55, 0x55ffff, 0x5555ff, 0xff55ff
+};
+static bool     rainbow_session = false;
+static bool     rainbow_weekly = false;
+static uint8_t  rainbow_phase = 0;    // advances once per second
+// The plain text and color each label falls back to when its window is not
+// rainbowing. Cached because the rainbow overwrites the label text itself,
+// and because enterprise picks the weekly color from pace rather than pct.
+static lv_color_t base_bar_session_col;
+static lv_color_t base_bar_weekly_col;
+static char       txt_session_pct[16];
+static char       txt_session_reset[24];
+static char       txt_weekly_pct[16];
+static char       txt_weekly_reset[96];   // enterprise packs recolor markup in here
 // Enterprise-only widgets inside panel_session
 static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
-static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
-static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
+static lv_obj_t* lbl_spending_desc = nullptr;     // "of monthly budget"
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
 // ---- Battery indicator (shared, on top) ----
@@ -293,9 +358,35 @@ static const char* const anim_messages[] = {
 };
 #define ANIM_MSG_COUNT (sizeof(anim_messages) / sizeof(anim_messages[0]))
 
+// Fraction of a usage window already elapsed, 0-100. Returns -1 when there is
+// no active window: the daemon's reset_minutes() sends 0 once the reset
+// timestamp is in the past (board idle overnight), and -1 for enterprise,
+// which has no 5h window at all. Callers render -1 as "no marker".
+static int elapsed_pct(int reset_mins, int window_mins) {
+    if (reset_mins <= 0 || reset_mins > window_mins) return -1;
+    return (int)(100.0f * (float)(window_mins - reset_mins) / (float)window_mins + 0.5f);
+}
+
+// Absolute level. Only used where there is no window to pace against.
 static lv_color_t pct_color(float pct) {
     if (pct >= 80.0f) return COL_RED;
     if (pct >= 50.0f) return COL_AMBER;
+    return COL_GREEN;
+}
+
+// Pace ratio, matching color_pace() in ~/bin/claude-statusline: the color says
+// whether you are burning faster than the window is elapsing, not how full the
+// bucket is. 88% used at 92% elapsed is green; 88% at 40% elapsed is red.
+// Falls back to the absolute scale when there is no active window to compare
+// against, the same way render_window() does without a resets_at.
+static lv_color_t window_pace_color(float used_pct, int elapsed) {
+    if (elapsed < 0)  return pct_color(used_pct);
+    // elapsed_pct() rounds to 0 for the first ~1% of a window (1.5 min of
+    // 5h, ~50 min of 7d); floor at 1 so heavy early use still reads hot.
+    if (elapsed == 0) elapsed = 1;
+    int ratio = (int)(used_pct * 100.0f / (float)elapsed);
+    if (ratio >= 200) return COL_RED;
+    if (ratio > 100)  return COL_AMBER;
     return COL_GREEN;
 }
 
@@ -308,6 +399,19 @@ static void format_reset_time(int mins, char* buf, size_t len) {
         snprintf(buf, len, "Resets in %dh %dm", mins / 60, mins % 60);
     } else {
         snprintf(buf, len, "Resets in %dd %dh", mins / 1440, (mins % 1440) / 60);
+    }
+}
+
+// Same durations, no "Resets in " prefix — fits the narrow top-row tiles.
+static void format_reset_time_short(int mins, char* buf, size_t len) {
+    if (mins < 0) {
+        snprintf(buf, len, "---");
+    } else if (mins < 60) {
+        snprintf(buf, len, "%dm", mins);
+    } else if (mins < 1440) {
+        snprintf(buf, len, "%dh %dm", mins / 60, mins % 60);
+    } else {
+        snprintf(buf, len, "%dd %dh", mins / 1440, (mins % 1440) / 60);
     }
 }
 
@@ -346,6 +450,49 @@ static lv_obj_t* make_bar(lv_obj_t* parent, int x, int y, int w, int h) {
     return bar;
 }
 
+// Small labels share the reset row with the much larger countdown. Aligning
+// their boxes to the same y sits them high; offset by the difference in
+// baseline position so the text lines up optically instead.
+static int baseline_drop(const lv_font_t* big, const lv_font_t* small) {
+    int b = big->line_height - big->base_line;
+    int s = small->line_height - small->base_line;
+    return (b - s) > 0 ? (b - s) : 0;
+}
+
+// Pace tick: a thin vertical line drawn over a bar at the "you should be here"
+// position for how far into the window you are. Taller than the bar so it
+// overhangs both edges and reads as a marker rather than a gap in the fill.
+#define MARKER_W 3
+static lv_obj_t* make_marker(lv_obj_t* parent, int bar_y, int bar_h) {
+    lv_obj_t* m = lv_obj_create(parent);
+    lv_obj_set_size(m, MARKER_W, bar_h + 8);
+    lv_obj_set_pos(m, 0, bar_y - 4);
+    lv_obj_set_style_bg_color(m, COL_TEXT, 0);
+    lv_obj_set_style_bg_opa(m, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(m, 2, 0);
+    lv_obj_set_style_border_width(m, 0, 0);
+    lv_obj_set_style_pad_all(m, 0, 0);
+    lv_obj_clear_flag(m, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(m, LV_OBJ_FLAG_HIDDEN);
+    return m;
+}
+
+// Position the tick at `pct` along a `bar_w`-wide bar; pct < 0 hides it.
+static void place_marker(lv_obj_t* m, int pct, int bar_w, int bar_y) {
+    if (!m) return;
+    if (pct < 0) {
+        lv_obj_add_flag(m, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    int max_x = bar_w - MARKER_W;
+    if (max_x < 0) max_x = 0;
+    int x = pct * max_x / 100;
+    if (x < 0) x = 0;
+    if (x > max_x) x = max_x;
+    lv_obj_set_pos(m, x, bar_y - 4);
+    lv_obj_clear_flag(m, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void init_icon_dsc_rgb565a8(lv_image_dsc_t* dsc, int w, int h, const uint8_t* data) {
     dsc->header.w = w;
     dsc->header.h = h;
@@ -355,18 +502,19 @@ static void init_icon_dsc_rgb565a8(lv_image_dsc_t* dsc, int w, int h, const uint
     dsc->data_size = w * h * 3;
 }
 
-static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
+static lv_obj_t* make_pill(lv_obj_t* parent, const char* text,
+                           const lv_font_t* font, int pad_x, int pad_y) {
     lv_obj_t* lbl = lv_label_create(parent);
     lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_font(lbl, L.pill_font, 0);
+    lv_obj_set_style_text_font(lbl, font, 0);
     lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
     lv_obj_set_style_bg_color(lbl, COL_BAR_BG, 0);
     lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(lbl, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl, L.pill_pad_x, 0);
-    lv_obj_set_style_pad_right(lbl, L.pill_pad_x, 0);
-    lv_obj_set_style_pad_top(lbl, L.pill_pad_y, 0);
-    lv_obj_set_style_pad_bottom(lbl, L.pill_pad_y, 0);
+    lv_obj_set_style_pad_left(lbl, pad_x, 0);
+    lv_obj_set_style_pad_right(lbl, pad_x, 0);
+    lv_obj_set_style_pad_top(lbl, pad_y, 0);
+    lv_obj_set_style_pad_bottom(lbl, pad_y, 0);
     return lbl;
 }
 
@@ -388,28 +536,46 @@ static void init_battery_icons(void) {
 
 // ======== Usage Screen ========
 
-static lv_obj_t* make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
+static lv_obj_t* make_usage_panel(lv_obj_t* parent, int x, int y, int w, int h,
+                                  int bar_y, int reset_y, const char* pill_text,
+                                  const lv_font_t* pill_font, int pill_pad_x, int pill_pad_y,
                                   lv_obj_t** out_pct, lv_obj_t** out_pill,
-                                  lv_obj_t** out_bar, lv_obj_t** out_reset) {
-    lv_obj_t* panel = make_panel(parent, L.margin, y, L.content_w, L.usage_panel_h);
+                                  lv_obj_t** out_bar, lv_obj_t** out_reset,
+                                  lv_obj_t** out_marker, int* out_bar_w,
+                                  lv_obj_t** out_elapsed) {
+    lv_obj_t* panel = make_panel(parent, x, y, w, h);
 
     *out_pct = lv_label_create(panel);
+    // Recolor markup is how the rainbow tints these per character.
+    lv_label_set_recolor(*out_pct, true);
     lv_label_set_text(*out_pct, "---%");
     lv_obj_set_style_text_font(*out_pct, L.pct_font, 0);
     lv_obj_set_style_text_color(*out_pct, COL_TEXT, 0);
     lv_obj_set_pos(*out_pct, 0, 0);
 
-    *out_pill = make_pill(panel, pill_text);
+    *out_pill = make_pill(panel, pill_text, pill_font, pill_pad_x, pill_pad_y);
     lv_obj_align(*out_pill, LV_ALIGN_TOP_RIGHT, 0, 1);
 
-    *out_bar = make_bar(panel, 0, L.usage_bar_y,
-                        L.content_w - 2 * L.panel_pad_x, L.bar_h);
+    int bar_w = w - 2 * L.panel_pad_x;
+    *out_bar = make_bar(panel, 0, bar_y, bar_w, L.bar_h);
+    // After the bar, so the tick draws on top of the fill.
+    *out_marker = make_marker(panel, bar_y, L.bar_h);
+    *out_bar_w = bar_w;
 
     *out_reset = lv_label_create(panel);
+    lv_label_set_recolor(*out_reset, true);
     lv_label_set_text(*out_reset, "---");
     lv_obj_set_style_text_font(*out_reset, L.reset_font, 0);
     lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
-    lv_obj_set_pos(*out_reset, 0, L.usage_reset_y);
+    lv_obj_set_pos(*out_reset, 0, reset_y);
+
+    // Elapsed-window number, small and dim, sitting on the big percentage's
+    // baseline the way the statusline prints "42%/50%". Positioned in
+    // realign_elapsed() because the anchor's width changes with the value.
+    *out_elapsed = lv_label_create(panel);
+    lv_label_set_text(*out_elapsed, "");
+    lv_obj_set_style_text_font(*out_elapsed, L.pace_font, 0);
+    lv_obj_set_style_text_color(*out_elapsed, COL_DIM, 0);
 
     return panel;
 }
@@ -498,9 +664,23 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_clear_flag(usage_group, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(usage_group, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    panel_session = make_usage_panel(usage_group, L.content_y, "Current",
+    panel_session = make_usage_panel(usage_group, L.margin, L.content_y,
+                     L.content_w, L.usage_top_h,
+                     L.usage_top_bar_y, L.usage_top_reset_y, "Current",
+                     L.pill_font, L.pill_pad_x, L.pill_pad_y,
                      &lbl_session_pct, &lbl_session_label,
-                     &bar_session, &lbl_session_reset);
+                     &bar_session, &lbl_session_reset,
+                     &marker_session, &bar_session_w, &lbl_session_elapsed);
+
+    // Burn rate sits between the countdown and the elapsed number on the
+    // Current tile's bottom row. It is not part of the pace signal, so it
+    // keeps its tier color and never joins the rainbow.
+    lbl_rate = lv_label_create(panel_session);
+    lv_label_set_text(lbl_rate, "");
+    lv_obj_set_style_text_font(lbl_rate, L.pace_font, 0);
+    lv_obj_set_style_text_color(lbl_rate, COL_DIM, 0);
+    lv_obj_align(lbl_rate, LV_ALIGN_TOP_MID, 0,
+                 L.usage_top_reset_y + baseline_drop(L.reset_font, L.pace_font));
 
     // Enterprise-only overlays inside panel_session — hidden until enterprise data arrives
     lbl_session_pct_sym = lv_label_create(panel_session);
@@ -510,24 +690,19 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
 
     lbl_spending_desc = lv_label_create(panel_session);
-    lv_label_set_text(lbl_spending_desc, "of your monthly budget");
+    lv_label_set_text(lbl_spending_desc, "of monthly budget");   // fits 368 wide
     lv_obj_set_style_text_font(lbl_spending_desc, L.reset_font, 0);
     lv_obj_set_style_text_color(lbl_spending_desc, COL_DIM, 0);
-    lv_obj_set_pos(lbl_spending_desc, 0, L.usage_reset_y);
+    lv_obj_set_pos(lbl_spending_desc, 0, L.usage_top_reset_y);
     lv_obj_add_flag(lbl_spending_desc, LV_OBJ_FLAG_HIDDEN);
 
-    lbl_spending_status = lv_label_create(panel_session);
-    lv_label_set_text(lbl_spending_status, "");
-    lv_obj_set_style_text_font(lbl_spending_status, L.pace_font, 0);
-    lv_obj_set_pos(lbl_spending_status, 0, L.usage_reset_y + 20);
-    lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
-
-    panel_weekly = make_usage_panel(usage_group,
-                     L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly",
+    panel_weekly = make_usage_panel(usage_group, L.margin,
+                     L.content_y + L.usage_top_h + L.usage_panel_gap, L.content_w, L.usage_bottom_h,
+                     L.usage_bottom_bar_y, L.usage_bottom_reset_y, "Weekly",
+                     L.pill_font, L.pill_pad_x, L.pill_pad_y,
                      &lbl_weekly_pct, &lbl_weekly_label,
-                     &bar_weekly, &lbl_weekly_reset);
-    // Recolor enabled so enterprise period box can color pace and reset separately
-    lv_label_set_recolor(lbl_weekly_reset, true);
+                     &bar_weekly, &lbl_weekly_reset,
+                     &marker_weekly, &bar_weekly_w, &lbl_weekly_elapsed);
 
     build_pair_group(usage_container);
     build_idle_group(usage_container);
@@ -544,6 +719,8 @@ static void init_usage_screen(lv_obj_t* scr) {
 
 void ui_init(void) {
     compute_layout(board_caps());
+    base_bar_session_col = COL_GREEN;
+    base_bar_weekly_col  = COL_GREEN;
 
     lv_obj_t* scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, COL_BG, 0);
@@ -590,6 +767,68 @@ void ui_init(void) {
     }
 }
 
+// Per-character gradient via LVGL recolor markup, matching rainbow() in the
+// statusline: character i takes palette slot (i + phase). Spaces are left
+// uncolored — a "#RRGGBB  #" run confuses the recolor parser. The label must
+// have lv_label_set_recolor(lbl, true).
+static void set_rainbow_text(lv_obj_t* lbl, const char* src, uint8_t phase) {
+    char out[320];
+    size_t o = 0;
+    for (size_t i = 0; src[i] && o + 12 < sizeof(out); i++) {
+        if (src[i] == ' ') { out[o++] = ' '; continue; }
+        o += snprintf(out + o, sizeof(out) - o, "#%06x %c#",
+                      (unsigned)RB_COLORS[(i + phase) % RB_COUNT], src[i]);
+    }
+    out[o] = 0;
+    lv_label_set_text(lbl, out);
+}
+
+// Single owner of every color that rainbow mode touches. Called from both
+// ui_update (fresh payload) and ui_tick_anim (hue step) — split ownership
+// would let the tick clobber the payload's bar colors, and would leave the
+// rainbow colors stuck on screen for up to a minute after it deactivates.
+// Recolors pill *text*, not pill backgrounds: a saturated hue behind the
+// near-white COL_TEXT is unreadable through much of the cycle.
+// The elapsed labels hang off the right edge of the percentage labels, whose
+// width changes with the value ("9%" vs "100%"), so re-anchor them whenever
+// that text is rewritten. The y-offset drops them from the percentage's box
+// top onto its baseline.
+static void realign_elapsed(void) {
+    int drop = baseline_drop(L.pct_font, L.pace_font);
+    if (lbl_session_elapsed && lbl_session_pct)
+        lv_obj_align_to(lbl_session_elapsed, lbl_session_pct, LV_ALIGN_OUT_RIGHT_TOP, 6, drop);
+    if (lbl_weekly_elapsed && lbl_weekly_pct)
+        lv_obj_align_to(lbl_weekly_elapsed, lbl_weekly_pct, LV_ALIGN_OUT_RIGHT_TOP, 6, drop);
+}
+
+static void apply_colors(void) {
+    if (!bar_session || !bar_weekly) return;
+
+    lv_color_t rb = lv_color_hex(RB_COLORS[rainbow_phase % RB_COUNT]);
+
+    if (rainbow_session) {
+        lv_obj_set_style_bg_color(bar_session, rb, LV_PART_INDICATOR);
+        set_rainbow_text(lbl_session_pct,   txt_session_pct,   rainbow_phase);
+        set_rainbow_text(lbl_session_reset, txt_session_reset, rainbow_phase);
+    } else {
+        lv_obj_set_style_bg_color(bar_session, base_bar_session_col, LV_PART_INDICATOR);
+        lv_label_set_text(lbl_session_pct,   txt_session_pct);
+        lv_label_set_text(lbl_session_reset, txt_session_reset);
+    }
+
+    if (rainbow_weekly) {
+        lv_obj_set_style_bg_color(bar_weekly, rb, LV_PART_INDICATOR);
+        set_rainbow_text(lbl_weekly_pct,   txt_weekly_pct,   rainbow_phase);
+        set_rainbow_text(lbl_weekly_reset, txt_weekly_reset, rainbow_phase);
+    } else {
+        lv_obj_set_style_bg_color(bar_weekly, base_bar_weekly_col, LV_PART_INDICATOR);
+        lv_label_set_text(lbl_weekly_pct,   txt_weekly_pct);
+        lv_label_set_text(lbl_weekly_reset, txt_weekly_reset);
+    }
+
+    realign_elapsed();
+}
+
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
     data_ok = data->ok;
@@ -609,6 +848,47 @@ void ui_update(const UsageData* data) {
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
+    // Rate tile. usage_rate_sample() is fed in main's BLE poll just before this
+    // call, so the value is current. It reports a negative rate for the first
+    // ~4 minutes after boot (and again after every session reset) while its
+    // ring buffer refills — "Waiting" rather than a misleading "Idle".
+    if (lbl_rate) {
+        float rate = usage_rate_pct_per_min();
+        if (rate < 0.0f) {
+            lv_label_set_text(lbl_rate, "Waiting");
+            lv_obj_set_style_text_color(lbl_rate, COL_DIM, 0);
+        } else {
+            static const char* const RATE_WORDS[] = { "Idle", "Normal", "Active", "Heavy" };
+            const lv_color_t RATE_COLORS[] = { COL_GREEN, COL_GREEN, COL_AMBER, COL_RED };
+            int g = usage_rate_group();
+            // LVGL's lv_snprintf drops floats unless LV_SPRINTF_USE_FLOAT is
+            // set, so format with the C library and set the text directly.
+            char rbuf[32];
+            snprintf(rbuf, sizeof(rbuf), "%s  %.2f %%/min", RATE_WORDS[g], rate);
+            lv_label_set_text(lbl_rate, rbuf);
+            lv_obj_set_style_text_color(lbl_rate, RATE_COLORS[g], 0);
+        }
+    }
+
+    // Enterprise has no 5h/7d windows: the period bar's own value is time_pct,
+    // so a pace tick would sit on the fill tip and there is nothing to rainbow.
+    int elapsed_s = data->enterprise ? -1
+                  : elapsed_pct(data->session_reset_mins, SESSION_WINDOW_MINS);
+    int elapsed_w = data->enterprise ? -1
+                  : elapsed_pct(data->weekly_reset_mins, WEEKLY_WINDOW_MINS);
+
+    // Each window rainbows through its own final stretch, independently.
+    rainbow_session = elapsed_s >= 0 && data->session_reset_mins <= RAINBOW_5H_MINS;
+    rainbow_weekly  = elapsed_w >= 0 && data->weekly_reset_mins  <= RAINBOW_7D_MINS;
+
+    place_marker(marker_session, elapsed_s, bar_session_w, L.usage_top_bar_y);
+    place_marker(marker_weekly,  elapsed_w, bar_weekly_w,  L.usage_bottom_bar_y);
+
+    if (elapsed_s >= 0) lv_label_set_text_fmt(lbl_session_elapsed, "/%d%%", elapsed_s);
+    else                lv_label_set_text(lbl_session_elapsed, "");
+    if (elapsed_w >= 0) lv_label_set_text_fmt(lbl_weekly_elapsed, "/%d%%", elapsed_w);
+    else                lv_label_set_text(lbl_weekly_elapsed, "");
+
     if (data->enterprise) {
         // Spending box: big number-only label + small "%" symbol + desc + pace
         lv_obj_set_style_text_font(lbl_session_pct, L.ent_pct_font, 0);
@@ -616,7 +896,7 @@ void ui_update(const UsageData* data) {
         lv_obj_add_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(lbl_spending_status,   LV_OBJ_FLAG_HIDDEN);
+        if (lbl_rate) lv_obj_add_flag(lbl_rate, LV_OBJ_FLAG_HIDDEN);
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
@@ -624,7 +904,7 @@ void ui_update(const UsageData* data) {
         lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
+        if (lbl_rate) lv_obj_clear_flag(lbl_rate, LV_OBJ_FLAG_HIDDEN);
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -641,38 +921,41 @@ void ui_update(const UsageData* data) {
     }
 
     if (data->enterprise) {
-        lv_label_set_text_fmt(lbl_session_pct, "%d", s_pct);
+        snprintf(txt_session_pct, sizeof(txt_session_pct), "%d", s_pct);
+        txt_session_reset[0] = 0;
+        lv_label_set_text(lbl_session_pct, txt_session_pct);
         lv_obj_align_to(lbl_session_pct_sym, lbl_session_pct,
                         LV_ALIGN_OUT_RIGHT_TOP, 4, 12);
     } else {
-        lv_label_set_text_fmt(lbl_session_pct, "%d%%", s_pct);
-        format_reset_time(data->session_reset_mins, buf, sizeof(buf));
-        lv_label_set_text(lbl_session_reset, buf);
+        snprintf(txt_session_pct, sizeof(txt_session_pct), "%d%%", s_pct);
+        format_reset_time_short(data->session_reset_mins, txt_session_reset,
+                                sizeof(txt_session_reset));
     }
 
     lv_bar_set_value(bar_session, s_pct, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar_session, pct_color(data->session_pct), LV_PART_INDICATOR);
+    base_bar_session_col = window_pace_color(data->session_pct, elapsed_s);
 
     if (data->enterprise) {
         // Period box: time % + dynamic pace color + "Resets <date>" label
         lv_label_set_text(lbl_weekly_label, "Period");
-        lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", data->time_pct);
+        snprintf(txt_weekly_pct, sizeof(txt_weekly_pct), "%d%%", data->time_pct);
         lv_bar_set_value(bar_weekly, data->time_pct, LV_ANIM_ON);
-        lv_color_t bar_pace = (data->session_pct <= (float)data->time_pct) ? COL_GREEN :
+        base_bar_weekly_col = (data->session_pct <= (float)data->time_pct) ? COL_GREEN :
                               (data->session_pct <= (float)data->time_pct + 15.0f) ? COL_AMBER :
                               COL_RED;
-        lv_obj_set_style_bg_color(bar_weekly, bar_pace, LV_PART_INDICATOR);
-        snprintf(buf, sizeof(buf), "#%s %s# - #faf9f5 Resets %s#",
+        snprintf(txt_weekly_reset, sizeof(txt_weekly_reset),
+                 "#%s %s# - #faf9f5 Resets %s#",
                  pace_hex, pace_text, data->reset_date);
-        lv_label_set_text(lbl_weekly_reset, buf);
     } else {
         int w_pct = (int)(data->weekly_pct + 0.5f);
-        lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
+        snprintf(txt_weekly_pct, sizeof(txt_weekly_pct), "%d%%", w_pct);
         lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
-        lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
-        format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
-        lv_label_set_text(lbl_weekly_reset, buf);
+        base_bar_weekly_col = window_pace_color(data->weekly_pct, elapsed_w);
+        format_reset_time(data->weekly_reset_mins, txt_weekly_reset,
+                          sizeof(txt_weekly_reset));
     }
+
+    apply_colors();
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -704,6 +987,17 @@ void ui_tick_anim(void) {
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
 
     uint32_t now = lv_tick_get();
+
+    // Rainbow steps one palette slot per second, like the statusline's
+    // `now % 6`. Only redraws on the second boundary, and only on view_state 2
+    // (the live usage panels) — the bars and numbers are hidden otherwise.
+    if ((rainbow_session || rainbow_weekly) && view_state == 2) {
+        uint8_t phase = (uint8_t)((now / 1000) % RB_COUNT);
+        if (phase != rainbow_phase) {
+            rainbow_phase = phase;
+            apply_colors();
+        }
+    }
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
