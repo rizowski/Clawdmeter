@@ -8,6 +8,7 @@
 #include "ui.h"
 #include "ble.h"
 #include "prov.h"
+#include "net.h"
 #include "splash.h"
 #include "usage_rate.h"
 #include "idle.h"
@@ -179,9 +180,15 @@ static void check_serial_cmd() {
             //   prov {"ssid":..,"wpass":..,"broker_id":..,"pass":..}
             //   provbegin   → show a setup code, as clawdmeter-setup would
             //   provclear   → forget WiFi/MQTT only (keeps the BLE bond)
-            else if (strncmp(cmd_buf, "prov ", 5) == 0)
-                Serial.println(prov_apply_unchecked(cmd_buf + 5) ? "PROV_OK" : "PROV_ERR");
-            else if (strcmp(cmd_buf, "provclear") == 0) prov_clear();
+            else if (strncmp(cmd_buf, "prov ", 5) == 0) {
+                bool ok = prov_apply_unchecked(cmd_buf + 5);
+                if (ok) net_apply_config();
+                Serial.println(ok ? "PROV_OK" : "PROV_ERR");
+            }
+            else if (strcmp(cmd_buf, "provclear") == 0) {
+                prov_clear();
+                net_apply_config();
+            }
             else if (strcmp(cmd_buf, "provbegin") == 0) {
                 char resp[64];
                 prov_handle_write("{\"op\":\"begin\"}", resp, sizeof resp);
@@ -246,6 +253,7 @@ void setup() {
 
     ble_init();
     prov_init();
+    net_init();
     input_hal_init();
 
     ui_init();
@@ -253,7 +261,7 @@ void setup() {
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
 
-    Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
+    Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE/WiFi...\n",
         board_caps().name, W, H);
 }
 
@@ -289,6 +297,7 @@ static void pair_tick(void) {
             Serial.println("Pair: released in window — clearing bonds + WiFi config, advertising");
             ble_clear_bonds();
             prov_clear();
+            net_apply_config();
         } else {
             Serial.println("Pair: released too early — cancelled");
         }
@@ -304,6 +313,32 @@ static void pair_tick(void) {
         pair_state = PAIR_IDLE;  // power-off territory; don't pair
         Serial.println("Pair: disarmed (holding toward power-off)");
     }
+}
+
+// One usage payload from either transport → usage-rate, chime, UI. Only the
+// BLE path acks: MQTT QoS 1 already confirms delivery.
+static void handle_payload(const char* json, bool from_ble) {
+    if (!parse_json(json, &usage)) {
+        if (from_ble) ble_send_nack();
+        return;
+    }
+    int g_before = usage_rate_group();
+    bool session_reset = usage_rate_sample(usage.session_pct);
+    int g_after = usage_rate_group();
+    // 5-hour session limit refilled → chime so the user knows they can
+    // use Claude again (no-op on boards without a buzzer). Gated on the
+    // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
+    if (session_reset && usage.chime) {
+        Serial.println("session reset detected — chime");
+        sound_hal_play_reset();
+    }
+    if (g_after != g_before) {
+        Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+            g_before, g_after, usage.session_pct);
+        if (splash_is_active()) splash_pick_for_current_rate();
+    }
+    ui_update(&usage);
+    if (from_ble) ble_send_ack();
 }
 
 void loop() {
@@ -392,35 +427,19 @@ void loop() {
 
     if (ble_has_prov()) {
         char resp[64];
-        prov_handle_write(ble_get_prov(), resp, sizeof resp);
+        bool applied = prov_handle_write(ble_get_prov(), resp, sizeof resp);
         ble_prov_notify(resp);
+        if (applied) net_apply_config();
+    }
+    // Tell clawdmeter-setup the whole path works once the broker answers.
+    if (net_get_state() == NET_CONNECTED && prov_take_net_up_pending()) {
+        ble_prov_notify("{\"net\":\"up\"}");
     }
 
     check_serial_cmd();
 
-    if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            bool session_reset = usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            // 5-hour session limit refilled → chime so the user knows they can
-            // use Claude again (no-op on boards without a buzzer). Gated on the
-            // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
-            if (session_reset && usage.chime) {
-                Serial.println("session reset detected — chime");
-                sound_hal_play_reset();
-            }
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
-            }
-            ui_update(&usage);
-            ble_send_ack();
-        } else {
-            ble_send_nack();
-        }
-    }
+    if (ble_has_data()) handle_payload(ble_get_data(), true);
+    if (net_has_data()) handle_payload(net_get_data(), false);
 
     delay(5);
 }
