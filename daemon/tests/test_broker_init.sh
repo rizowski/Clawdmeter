@@ -1,0 +1,57 @@
+#!/bin/bash
+# Test for daemon/broker/broker-init.sh: generated state + a live mosquitto
+# enforcing passwords and per-device ACLs. The live half is skipped when
+# mosquitto isn't installed.
+#
+# Run: bash daemon/tests/test_broker_init.sh
+set -u
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+INIT="$HERE/../broker/broker-init.sh"
+. "$HERE/../broker/find-tool.sh"
+
+TMP="$(mktemp -d)"
+BPID=""
+trap '[ -n "$BPID" ] && kill "$BPID" 2>/dev/null; rm -rf "$TMP"' EXIT
+fail=0
+check() { if eval "$1"; then echo "PASS: $2"; else echo "FAIL: $2"; fail=1; fi; }
+mode_of() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+
+export CLAWD_BROKER_PORT=18931   # never collide with a running daemon's 18830
+B="$TMP/b"
+bash "$INIT" "$B" >/dev/null || { echo "FAIL: broker-init exited non-zero"; exit 1; }
+
+check '[ -f "$B/broker.env" ] && [ -f "$B/passwd" ] && [ -f "$B/acl" ] && [ -f "$B/mosquitto.conf" ] && [ -f "$B/devices" ]' "all state files created"
+check '[ "$(mode_of "$B/broker.env")" = 600 ] && [ "$(mode_of "$B/passwd")" = 600 ]' "secrets are 0600"
+check '[ "$(mode_of "$B")" = 700 ]' "broker dir is 0700"
+. "$B/broker.env"
+check '[[ "$BROKER_ID" =~ ^[0-9a-f]{16}$ ]]' "broker id is 16 hex chars"
+check '[ "$BROKER_PORT" = 18931 ]' "port honours CLAWD_BROKER_PORT"
+check '[ ${#DAEMON_PASS} -eq 24 ]' "daemon password is 24 chars"
+check 'grep -q "^allow_anonymous false" "$B/mosquitto.conf"' "anonymous disabled"
+check 'grep -q "^listener 18931" "$B/mosquitto.conf"' "listener on configured port"
+first_id="$BROKER_ID"; first_pass="$DAEMON_PASS"
+bash "$INIT" "$B" >/dev/null
+. "$B/broker.env"
+check '[ "$BROKER_ID" = "$first_id" ] && [ "$DAEMON_PASS" = "$first_pass" ]' "re-run keeps id and password"
+
+MOSQ="$(clawd_find_tool mosquitto)" || { echo "SKIP: live broker checks (mosquitto not installed)"; exit $fail; }
+MPASS="$(clawd_find_tool mosquitto_passwd)"
+"$MOSQ" -c "$B/mosquitto.conf" >/dev/null 2>&1 &
+BPID=$!
+sleep 1
+P=(-h 127.0.0.1 -p 18931)
+
+check '! mosquitto_pub "${P[@]}" -t x -m y 2>/dev/null' "anonymous publish refused"
+check '! mosquitto_pub "${P[@]}" -u daemon -P wrong -t x -m y 2>/dev/null' "wrong password refused"
+
+"$MPASS" -b "$B/passwd" abc123 devpass
+kill -HUP "$BPID"; sleep 0.5
+mosquitto_pub "${P[@]}" -u daemon -P "$DAEMON_PASS" -q 1 -r -t clawdmeter/abc123/usage -m '{"s":1}'
+mosquitto_pub "${P[@]}" -u daemon -P "$DAEMON_PASS" -q 1 -r -t clawdmeter/ffffff/usage -m '{"s":2}'
+got="$(mosquitto_sub "${P[@]}" -u abc123 -P devpass -t clawdmeter/abc123/usage -C 1 -W 3 2>/dev/null)"
+check '[ "$got" = "{\"s\":1}" ]' "device reads its own retained usage"
+other="$(mosquitto_sub "${P[@]}" -u abc123 -P devpass -t clawdmeter/ffffff/usage -C 1 -W 2 2>/dev/null)"
+check '[ -z "$other" ]' "device cannot read another device's usage"
+
+exit $fail
