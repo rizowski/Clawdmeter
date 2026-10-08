@@ -35,7 +35,7 @@ Decisions already made with the user:
 - `status`: the device publishes `online`, retained. The LWT is `offline`. Used for diagnostics.
 
 ### Broker security (password auth, no certs)
-- Mosquitto runs as a child process of the daemon, using a generated config in `~/.config/clawdmeter/broker/`.
+- Mosquitto runs as a child process of the daemon, using a generated config in `~/.config/claude-usage-monitor/broker/` (next to the existing daemon config).
   - One listener on port **18830**. This non-default port avoids clashing with a Home Assistant or distro broker on 1883. mDNS advertises the port, so the device never hard-codes it.
   - `allow_anonymous false`.
 - No certs or secrets in the repo. All credentials are generated at install or setup time on the user's own machine.
@@ -43,9 +43,9 @@ Decisions already made with the user:
   - Creates the `daemon` user with a random password, using `mosquitto_passwd`.
   - Writes the ACL.
   - Generates a random `broker_id`.
-- ACL:
+- ACL (static file, never edited per device):
   - The daemon user can write `+/usage` and read `+/refresh` and `+/status`.
-  - Each device user can read only its own `usage` and write only its own `refresh` and `status`.
+  - The MQTT username of a device **is** its device id. So `pattern read clawdmeter/%u/usage` and `pattern write clawdmeter/%u/{refresh,status}` limit each device to its own topics.
 - `clawdmeter-setup` gives each device a random 24-char password. It adds the password to the password file and reloads mosquitto with SIGHUP.
 - Known limits, documented in the README:
   - MQTT traffic, including the password, is not encrypted on the LAN.
@@ -68,13 +68,15 @@ Decisions already made with the user:
   2. The device shows a random 6-digit code on screen for 120 s.
   3. The CLI prompts for the code. It detects the SSID (`nmcli` on Linux; on macOS it prompts with the last-used SSID as the default) and prompts for the WiFi password with hidden input.
   4. The CLI creates the device's MQTT user and password, then sends one JSON write, about 250 bytes, which is under the 512-byte ATT limit:
-     `{"op":"config","code":"123456","ssid":…,"wpass":…,"broker_id":…,"user":…,"pass":…}`
+     `{"op":"config","code":"123456","ssid":…,"wpass":…,"broker_id":…,"pass":…}`. There is no `user` field: the device uses its own id as the username.
+  - The `begin` reply is `{"id":"<device_id>"}`, so the CLI knows which MQTT user to create. On boards without WiFi it is `{"err":"nowifi"}`.
   5. The device checks the code first. If it is wrong, it notifies `{"err":"code"}`. After 5 failures the code is invalidated and the user must run `begin` again. If it is right, the device saves to NVS (namespace `clawdnet`) and notifies `{"ok":true}`. It then connects WiFi + MQTT and notifies `{"net":"up"}` once the broker connects, so the CLI can report success end to end.
 - Re-running setup overwrites the config. Hold-to-pair (`ble_clear_bonds`) also clears the WiFi config, which gives one factory-reset gesture.
 
 ### Firmware components
 - **`firmware/src/net.{h,cpp}`** (new):
-  - Functions: `net_init`, `net_tick`, `net_get_state` (OFF / WIFI / DISCOVERING / CONNECTED), `net_has_data`, `net_get_data`, `net_request_refresh`.
+  - Functions: `net_init`, `net_apply_config`, `net_get_state` (OFF / WIFI / DISCOVERING / CONNECTED / AUTH_FAIL), `net_has_data`, `net_get_data`. The device sends its refresh request inside the MQTT connect handler, so no separate refresh call is needed.
+  - All blocking work (WiFi join, the ~3 s mDNS browse, esp-mqtt start and stop) runs on a dedicated FreeRTOS task, so the LVGL loop never stalls.
   - It mirrors the `ble_has_data` / `ble_get_data` polling shape, so `main.cpp` treats both sources the same.
   - The esp-mqtt event handler copies the payload into a 512-byte buffer under a mutex, because esp-mqtt runs in its own task.
   - When `BOARD_HAS_WIFI` is not set, the functions compile to no-op stubs (C6 + sim).
@@ -91,6 +93,7 @@ Decisions already made with the user:
   - The status line shows "WiFi…", "Finding host…" or "Connected".
 - **Board flags**: add `-DBOARD_HAS_WIFI` to the five S3 envs in `platformio.ini`. This is a capability flag, not `#ifdef BOARD_*`, so it follows `docs/porting/capability-flags.md`.
 - **Flash**: set `waveshare_amoled_216` to 16 MB / `default_16MB.csv` like the other S3 envs, in case WiFi pushes the app past the default partition. Check sizes after the build.
+- **Serial dev commands**: `prov {json}` writes a config without a code check (USB access already means physical control), and `provbegin` shows a code. Both let net and UI be tested before the setup CLI exists.
 - **Sim**: the stubbed `net` reports OFF, so the sim stays unchanged. Optionally add a `w` key later to fake MQTT state (YAGNI for v1).
 
 ### Host components
@@ -106,7 +109,7 @@ Decisions already made with the user:
   - Refresh uses `mosquitto_sub`, which touches the existing flag file. This reuses the dbus-monitor flag pattern (`.sh:230-247`).
 - **Installers**:
   - `install-mac.sh`: `brew install mosquitto`, and add `paho-mqtt` + `zeroconf` to the venv.
-  - `install.sh`: `apt install mosquitto mosquitto-clients avahi-utils` and a python venv for the setup CLI. The systemd unit stops the broker service mosquitto ships with, so it does not clash on ports. The daemon uses its own conf on 18830 only.
+  - `install.sh`: `apt install mosquitto mosquitto-clients avahi-utils` and a python venv for the setup CLI. The distro's mosquitto service stays as it is. Our broker uses its own conf on 18830, so the two do not clash.
 - **Docs**: a README section "WiFi setup", the protocol table updated with PROV + topics, and a CLAUDE.md "Daemon / host side" note.
 
 ## Error handling
