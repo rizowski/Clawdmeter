@@ -37,11 +37,16 @@ bool netcfg_parse(const char* json, NetConfig* out) {
     return true;
 }
 
-void prov_session_begin(ProvSession* s, uint32_t rand32, uint32_t now_ms) {
+bool prov_session_begin(ProvSession* s, uint32_t rand32, uint32_t now_ms) {
+    if (s->locked) {
+        if ((int32_t)(now_ms - s->lock_until_ms) < 0) return false;
+        s->locked = false;
+        s->fails = 0;   // lockout served: a fresh budget
+    }
     s->active = true;
     snprintf(s->code, sizeof s->code, "%06lu", (unsigned long)(rand32 % 1000000u));
     s->expires_ms = now_ms + PROV_CODE_TTL_MS;
-    s->fails = 0;
+    return true;
 }
 
 bool prov_session_visible(const ProvSession* s, uint32_t now_ms) {
@@ -59,12 +64,15 @@ prov_result_t prov_session_apply(ProvSession* s, const char* json, uint32_t now_
     if (strcmp(code, s->code) != 0) {
         if (++s->fails >= PROV_MAX_FAILS) {
             s->active = false;
+            s->locked = true;
+            s->lock_until_ms = now_ms + PROV_LOCKOUT_MS;
             return PROV_LOCKED;
         }
         return PROV_BAD_CODE;
     }
     if (!netcfg_parse(json, out)) return PROV_BAD_JSON;
     s->active = false;
+    s->fails = 0;
     return PROV_OK;
 }
 

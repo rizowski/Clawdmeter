@@ -23,13 +23,18 @@ struct ProvSession {
     bool     active;
     char     code[7];
     uint32_t expires_ms;
-    uint8_t  fails;
+    uint8_t  fails;          // wrong codes since the last success — survives a new begin
+    bool     locked;
+    uint32_t lock_until_ms;
 };
 
 static const uint32_t PROV_CODE_TTL_MS = 120000;
 static const uint8_t  PROV_MAX_FAILS   = 5;
+static const uint32_t PROV_LOCKOUT_MS  = 60000;  // after PROV_MAX_FAILS wrong codes
 
-void prov_session_begin(ProvSession* s, uint32_t rand32, uint32_t now_ms);
+// Shows a fresh code. Returns false (and shows nothing) during a lockout, so a
+// client can't refill its guess budget by re-requesting codes.
+bool prov_session_begin(ProvSession* s, uint32_t rand32, uint32_t now_ms);
 bool prov_session_visible(const ProvSession* s, uint32_t now_ms);
 // Checks the message's "code" against the session; on a match parses the
 // config into *out and ends the session. Bad JSON doesn't count as a wrong code.

@@ -69,7 +69,10 @@ bool prov_handle_write(const char* json, char* resp, size_t resp_n) {
     }
     const char* op = doc["op"] | "";
     if (strcmp(op, "begin") == 0) {
-        prov_session_begin(&sess, esp_random(), millis());
+        if (!prov_session_begin(&sess, esp_random(), millis())) {
+            snprintf(resp, resp_n, "{\"err\":\"locked\"}");   // too many wrong codes; wait a minute
+            return false;
+        }
         Serial.println("PROV: setup code shown");
         snprintf(resp, resp_n, "{\"id\":\"%s\"}", dev_id);
         return false;

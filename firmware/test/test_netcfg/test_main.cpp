@@ -123,6 +123,37 @@ static void should_format_device_id_from_last_three_base_mac_bytes() {
     CHECK(strcmp(id, "16e04c") == 0);
 }
 
+static void should_not_reset_wrong_code_count_on_a_new_begin() {
+    // Re-requesting a code must not refill the guess budget, or a client
+    // could guess 4 times, re-begin, and brute-force the 6 digits.
+    ProvSession s = {};
+    NetConfig c = {};
+    prov_session_begin(&s, 999999u, 0);
+    for (int i = 1; i < PROV_MAX_FAILS; i++) CHECK(prov_session_apply(&s, GOOD, 10, &c) == PROV_BAD_CODE);
+    CHECK(prov_session_begin(&s, 999998u, 20));
+    CHECK(prov_session_apply(&s, GOOD, 30, &c) == PROV_LOCKED);
+}
+
+static void should_refuse_begin_during_lockout_then_allow_after() {
+    ProvSession s = {};
+    NetConfig c = {};
+    prov_session_begin(&s, 999999u, 0);
+    for (int i = 0; i < PROV_MAX_FAILS; i++) prov_session_apply(&s, GOOD, 1000, &c);
+    CHECK(!prov_session_begin(&s, 123456u, 1000 + PROV_LOCKOUT_MS - 1));
+    CHECK(!s.active);
+    CHECK(prov_session_begin(&s, 123456u, 1000 + PROV_LOCKOUT_MS));
+    CHECK(prov_session_apply(&s, GOOD, 1000 + PROV_LOCKOUT_MS + 1, &c) == PROV_OK);
+}
+
+static void should_reset_wrong_code_count_after_success() {
+    ProvSession s = {};
+    NetConfig c = {};
+    prov_session_begin(&s, 123456u, 0);
+    CHECK(prov_session_apply(&s, "{\"code\":\"000000\"}", 1, &c) == PROV_BAD_CODE);
+    CHECK(prov_session_apply(&s, GOOD, 2, &c) == PROV_OK);
+    CHECK(s.fails == 0);
+}
+
 int main() {
     should_parse_config_with_json_hostile_chars();
     should_accept_max_length_ssid_and_pass_and_reject_longer();
@@ -136,6 +167,9 @@ int main() {
     should_reject_after_expiry();
     should_build_topics();
     should_format_device_id_from_last_three_base_mac_bytes();
+    should_not_reset_wrong_code_count_on_a_new_begin();
+    should_refuse_begin_during_lockout_then_allow_after();
+    should_reset_wrong_code_count_after_success();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all netcfg tests passed\n");
     return 0;
