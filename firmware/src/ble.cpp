@@ -11,6 +11,7 @@
 #define RX_CHAR_UUID        "4c41555a-4465-7669-6365-000000000002"  // host writes here
 #define TX_CHAR_UUID        "4c41555a-4465-7669-6365-000000000003"  // device ack/nack notifies
 #define REQ_CHAR_UUID       "4c41555a-4465-7669-6365-000000000004"  // device-initiated refresh request
+#define PROV_CHAR_UUID      "4c41555a-4465-7669-6365-000000000005"  // WiFi/MQTT provisioning
 
 #define BLE_BUF_SIZE 512
 
@@ -61,6 +62,9 @@ static NimBLECharacteristic* input_kbd = nullptr;
 static NimBLECharacteristic* tx_char = nullptr;
 static NimBLECharacteristic* rx_char = nullptr;
 static NimBLECharacteristic* req_char = nullptr;
+static NimBLECharacteristic* prov_char = nullptr;
+static char prov_buf[BLE_BUF_SIZE];
+static volatile bool prov_ready = false;
 
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
@@ -259,24 +263,29 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
 };
 
+// Only accept writes over a bonded+encrypted link, and only from the owner
+// machine. Another machine's daemon in range is ignored so the display never
+// rotates to a foreign account. The first encrypted writer claims ownership
+// when none is set yet (e.g. a fresh pairing). Shared by RX and PROV.
+static bool owner_write_allowed(NimBLEConnInfo& info, const char* what) {
+    std::string id = info.getIdAddress().toString();
+    if (!info.isEncrypted()) {
+        Serial.printf("BLE: dropping %s write from unencrypted link\n", what);
+        return false;
+    }
+    if (!owner_set && id != ZERO_ADDR) {
+        claim_owner(id);
+    }
+    if (owner_set && strcmp(id.c_str(), owner_addr) != 0) {
+        Serial.printf("BLE: dropping %s write from non-owner %s\n", what, id.c_str());
+        return false;
+    }
+    return true;
+}
+
 class RxCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
-        // Only accept usage data over a bonded+encrypted link, and only from the
-        // owner machine. Another machine's daemon in range is ignored so the
-        // display never rotates to a foreign account. The first encrypted writer
-        // claims ownership when none is set yet (e.g. a fresh pairing).
-        std::string id = info.getIdAddress().toString();
-        if (!info.isEncrypted()) {
-            Serial.println("BLE: dropping RX write from unencrypted link");
-            return;
-        }
-        if (!owner_set && id != ZERO_ADDR) {
-            claim_owner(id);
-        }
-        if (owner_set && strcmp(id.c_str(), owner_addr) != 0) {
-            Serial.printf("BLE: dropping RX write from non-owner %s\n", id.c_str());
-            return;
-        }
+        if (!owner_write_allowed(info, "RX")) return;
         std::string val = chr->getValue();
         size_t len = std::min(val.length(), (size_t)(BLE_BUF_SIZE - 1));
         memcpy(rx_buf, val.c_str(), len);
@@ -295,6 +304,17 @@ class ReqCallbacks : public NimBLECharacteristicCallbacks {
         if (subValue != 0 && !has_received_data) {
             ble_request_refresh();
         }
+    }
+};
+
+class ProvCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
+        if (!owner_write_allowed(info, "PROV")) return;
+        std::string val = chr->getValue();
+        size_t len = std::min(val.length(), (size_t)(BLE_BUF_SIZE - 1));
+        memcpy(prov_buf, val.c_str(), len);
+        prov_buf[len] = '\0';
+        prov_ready = true;
     }
 };
 
@@ -357,6 +377,13 @@ void ble_init(void) {
     );
     static ReqCallbacks reqCb;
     req_char->setCallbacks(&reqCb);
+
+    prov_char = svc->createCharacteristic(
+        PROV_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
+    );
+    static ProvCallbacks provCb;
+    prov_char->setCallbacks(&provCb);
 
     svc->start();
     server->start();
@@ -460,4 +487,20 @@ void ble_keyboard_release(void) {
     uint8_t report[8] = {0};
     input_kbd->setValue(report, sizeof(report));
     input_kbd->notify();
+}
+
+bool ble_has_prov(void) {
+    return prov_ready;
+}
+
+const char* ble_get_prov(void) {
+    prov_ready = false;
+    return prov_buf;
+}
+
+void ble_prov_notify(const char* json) {
+    if (state == BLE_STATE_CONNECTED && prov_char) {
+        prov_char->setValue(json);
+        prov_char->notify();
+    }
 }

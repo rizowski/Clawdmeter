@@ -7,6 +7,7 @@
 #include "data.h"
 #include "ui.h"
 #include "ble.h"
+#include "prov.h"
 #include "splash.h"
 #include "usage_rate.h"
 #include "idle.h"
@@ -125,7 +126,7 @@ static bool parse_json(const char* json, UsageData* out) {
 }
 
 // ---- Serial command buffer ----
-#define CMD_BUF_SIZE 64
+#define CMD_BUF_SIZE 384
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -174,6 +175,18 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
+            // Dev aids for the WiFi transport (no setup CLI needed):
+            //   prov {"ssid":..,"wpass":..,"broker_id":..,"pass":..}
+            //   provbegin   → show a setup code, as clawdmeter-setup would
+            //   provclear   → forget WiFi/MQTT only (keeps the BLE bond)
+            else if (strncmp(cmd_buf, "prov ", 5) == 0)
+                Serial.println(prov_apply_unchecked(cmd_buf + 5) ? "PROV_OK" : "PROV_ERR");
+            else if (strcmp(cmd_buf, "provclear") == 0) prov_clear();
+            else if (strcmp(cmd_buf, "provbegin") == 0) {
+                char resp[64];
+                prov_handle_write("{\"op\":\"begin\"}", resp, sizeof resp);
+                Serial.printf("%s code=%s\n", resp, prov_code());
+            }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -232,6 +245,7 @@ void setup() {
     lv_indev_set_read_cb(indev, my_touch_cb);
 
     ble_init();
+    prov_init();
     input_hal_init();
 
     ui_init();
@@ -272,8 +286,9 @@ static void pair_tick(void) {
 
     if (power_hal_pwr_released()) {
         if (pair_state == PAIR_ARMED) {
-            Serial.println("Pair: released in window — clearing bonds, advertising");
+            Serial.println("Pair: released in window — clearing bonds + WiFi config, advertising");
             ble_clear_bonds();
+            prov_clear();
         } else {
             Serial.println("Pair: released too early — cancelled");
         }
@@ -373,6 +388,12 @@ void loop() {
         last_pct = pct;
         last_charging = charging;
         ui_update_battery(pct, charging);
+    }
+
+    if (ble_has_prov()) {
+        char resp[64];
+        prov_handle_write(ble_get_prov(), resp, sizeof resp);
+        ble_prov_notify(resp);
     }
 
     check_serial_cmd();

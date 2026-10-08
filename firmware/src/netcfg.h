@@ -35,5 +35,10 @@ bool prov_session_visible(const ProvSession* s, uint32_t now_ms);
 // config into *out and ends the session. Bad JSON doesn't count as a wrong code.
 prov_result_t prov_session_apply(ProvSession* s, const char* json, uint32_t now_ms, NetConfig* out);
 
+// Device id = last 3 bytes of the 6-byte base MAC, lowercase hex. Callers pass
+// the 6-byte WiFi-STA MAC (esp_read_mac(..., ESP_MAC_WIFI_STA)), not the C6's
+// 8-byte EUI-64, which has an ff:fe filler in the middle.
+void netcfg_device_id(const uint8_t base_mac[6], char out[7]);
+
 // "clawdmeter/<device_id>/<leaf>"
 void netcfg_topic(char* out, size_t n, const char* device_id, const char* leaf);

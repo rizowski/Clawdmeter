@@ -68,6 +68,10 @@ prov_result_t prov_session_apply(ProvSession* s, const char* json, uint32_t now_
     return PROV_OK;
 }
 
+void netcfg_device_id(const uint8_t base_mac[6], char out[7]) {
+    snprintf(out, 7, "%02x%02x%02x", base_mac[3], base_mac[4], base_mac[5]);
+}
+
 void netcfg_topic(char* out, size_t n, const char* device_id, const char* leaf) {
     snprintf(out, n, "clawdmeter/%s/%s", device_id, leaf);
 }

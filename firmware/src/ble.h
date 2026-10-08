@@ -20,6 +20,11 @@ const char* ble_get_data(void);
 void ble_send_ack(void);
 void ble_send_nack(void);
 void ble_request_refresh(void);
+// Provisioning channel (PROV char ...0005): writes are handed to the loop task
+// the same way usage data is; replies go back as notifications.
+bool ble_has_prov(void);
+const char* ble_get_prov(void);
+void ble_prov_notify(const char* json);
 
 void ble_set_battery_level(int pct);
 

@@ -114,6 +114,15 @@ static void should_build_topics() {
     CHECK(strcmp(t, "clawdmeter/a1b2c3/usage") == 0);
 }
 
+static void should_format_device_id_from_last_three_base_mac_bytes() {
+    // Base MAC of the 2.16 C6 on the bench (its eFuse EUI-64 is
+    // 20:6e:f1:ff:fe:16:e0:4c — the id must skip the ff:fe filler).
+    const uint8_t mac[6] = {0x20, 0x6e, 0xf1, 0x16, 0xe0, 0x4c};
+    char id[7];
+    netcfg_device_id(mac, id);
+    CHECK(strcmp(id, "16e04c") == 0);
+}
+
 int main() {
     should_parse_config_with_json_hostile_chars();
     should_accept_max_length_ssid_and_pass_and_reject_longer();
@@ -126,6 +135,7 @@ int main() {
     should_not_count_bad_json_as_a_wrong_code();
     should_reject_after_expiry();
     should_build_topics();
+    should_format_device_id_from_last_three_base_mac_bytes();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all netcfg tests passed\n");
     return 0;

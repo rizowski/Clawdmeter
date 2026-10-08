@@ -149,3 +149,7 @@ void sim_playback_toggle_link(void) {
     connected = !connected;
     refresh_title();
 }
+
+bool ble_has_prov(void) { return false; }
+const char* ble_get_prov(void) { return ""; }
+void ble_prov_notify(const char* json) { printf("[sim] PROV notify %s\n", json); }
