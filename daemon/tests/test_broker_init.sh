@@ -22,7 +22,7 @@ B="$TMP/b"
 bash "$INIT" "$B" >/dev/null || { echo "FAIL: broker-init exited non-zero"; exit 1; }
 
 check '[ -f "$B/broker.env" ] && [ -f "$B/passwd" ] && [ -f "$B/acl" ] && [ -f "$B/mosquitto.conf" ] && [ -f "$B/devices" ]' "all state files created"
-check '[ "$(mode_of "$B/broker.env")" = 600 ] && [ "$(mode_of "$B/passwd")" = 600 ]' "secrets are 0600"
+check '[ "$(mode_of "$B/broker.env")" = 600 ] && [ "$(mode_of "$B/passwd")" = 600 ] && [ "$(mode_of "$B/client.conf")" = 600 ]' "secrets are 0600"
 check '[ "$(mode_of "$B")" = 700 ]' "broker dir is 0700"
 . "$B/broker.env"
 check '[[ "$BROKER_ID" =~ ^[0-9a-f]{16}$ ]]' "broker id is 16 hex chars"
@@ -44,6 +44,9 @@ P=(-h 127.0.0.1 -p 18931)
 
 check '! mosquitto_pub "${P[@]}" -t x -m y 2>/dev/null' "anonymous publish refused"
 check '! mosquitto_pub "${P[@]}" -u daemon -P wrong -t x -m y 2>/dev/null' "wrong password refused"
+# The daemon logs in through an options file so the password never sits in
+# argv (visible to every local user via ps).
+check 'mosquitto_pub -o "$B/client.conf" -t clawdmeter/abc123/status -m t 2>/dev/null' "daemon logs in via client.conf"
 
 "$MPASS" -b "$B/passwd" abc123 devpass
 kill -HUP "$BPID"; sleep 0.5

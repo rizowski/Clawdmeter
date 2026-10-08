@@ -37,8 +37,11 @@ if [ "$BROKER_PORT" != "$PORT" ] && [ -n "${CLAWD_BROKER_PORT:-}" ]; then
     BROKER_PORT="$PORT"
 fi
 
+# Passwords go in through stdin / a 0600 options file, never argv: a command
+# line is visible to every local user via ps.
 [ -f "$DIR/passwd" ] || : > "$DIR/passwd"
-"$MPASS" -b "$DIR/passwd" daemon "$DAEMON_PASS"
+printf '%s\n%s\n' "$DAEMON_PASS" "$DAEMON_PASS" | "$MPASS" "$DIR/passwd" daemon >/dev/null
+printf -- '-h 127.0.0.1\n-p %s\n-u daemon\n-P %s\n' "$BROKER_PORT" "$DAEMON_PASS" > "$DIR/client.conf"
 [ -f "$DIR/devices" ] || : > "$DIR/devices"
 
 # A device's MQTT username IS its device id, so %u patterns pin every device
@@ -68,5 +71,5 @@ log_type warning
 log_type notice
 CONF
 
-chmod 600 "$DIR"/broker.env "$DIR"/passwd "$DIR"/acl "$DIR"/mosquitto.conf "$DIR"/devices
+chmod 600 "$DIR"/broker.env "$DIR"/client.conf "$DIR"/passwd "$DIR"/acl "$DIR"/mosquitto.conf "$DIR"/devices
 echo "Broker ready: $DIR (id=$BROKER_ID, port=$BROKER_PORT)"
