@@ -354,6 +354,26 @@ send_payload() {
     fi
 }
 
+# One MQTT-mode tick at time $1: poll Anthropic when the interval has elapsed
+# or a device asked. A failed send (broker down) still counts as a poll, so a
+# dead broker costs one API call per POLL_INTERVAL, not one per TICK; the
+# retained message keeps the device's last numbers meanwhile.
+mqtt_tick() {
+    local now="$1"
+    if [ -f "$REFRESH_FLAG" ] || (( now - LAST_POLL >= POLL_INTERVAL )); then
+        if [ -f "$REFRESH_FLAG" ]; then
+            log "Refresh requested by device"
+            rm -f "$REFRESH_FLAG"
+        fi
+        if [ ! -s "$BROKER_DIR/devices" ]; then
+            log "No WiFi devices set up yet; run daemon/clawdmeter-setup"
+        else
+            poll
+        fi
+        LAST_POLL=$now
+    fi
+}
+
 stop_mqtt_side() {
     [ -n "$MQTT_SUB_PID" ] && kill -TERM -"$MQTT_SUB_PID" 2>/dev/null
     [ -n "$AVAHI_PID" ] && kill "$AVAHI_PID" 2>/dev/null
@@ -556,19 +576,7 @@ if [ "$TRANSPORT" = mqtt ]; then
     while true; do
         side_services_tick
         refresh_sub_ensure
-        NOW=$(date +%s)
-        if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
-            if [ -f "$REFRESH_FLAG" ]; then
-                log "Refresh requested by device"
-                rm -f "$REFRESH_FLAG"
-            fi
-            if [ ! -s "$BROKER_DIR/devices" ]; then
-                log "No WiFi devices set up yet; run daemon/clawdmeter-setup"
-                LAST_POLL=$NOW
-            else
-                poll && LAST_POLL=$NOW
-            fi
-        fi
+        mqtt_tick "$(date +%s)"
         sleep "$TICK"
     done
 fi

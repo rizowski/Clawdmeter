@@ -852,7 +852,13 @@ async def run_mqtt(env: dict, stop_event: asyncio.Event) -> None:
             if refresh.is_set() or time.time() - last_poll >= POLL_INTERVAL:
                 refresh.clear()
                 devices = mqtt_transport.read_devices()
-                if not devices:
+                if not pub.is_connected():
+                    # Broker down (or paho still reconnecting): skip the API
+                    # call — nothing could be delivered, and polling every TICK
+                    # would hammer the API. Retry next tick. (Refresh requests
+                    # arrive through the broker, so none are lost.)
+                    pass
+                elif not devices:
                     log("No WiFi devices set up yet; run daemon/clawdmeter-setup")
                     last_poll = time.time()
                 else:

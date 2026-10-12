@@ -24,6 +24,19 @@ check '[ "$(read_transport_setting)" = mqtt ]' "transport = mqtt is read"
 printf 'transport = pigeon\n' > "$CONFIG_FILE"
 check '[ "$(read_transport_setting)" = ble ]' "unknown transport falls back to ble"
 
+# A failed send (broker down) still counts as a poll: at most one API call
+# per POLL_INTERVAL instead of one every TICK.
+eval "$(extract mqtt_tick)"
+POLL_INTERVAL=60
+REFRESH_FLAG="$TMP/refresh"
+BROKER_DIR="$TMP/stub"; mkdir -p "$BROKER_DIR"; echo a1b2c3 > "$BROKER_DIR/devices"
+poll() { POLLS=$((POLLS + 1)); return 1; }
+POLLS=0; LAST_POLL=0
+mqtt_tick 1000; mqtt_tick 1005; mqtt_tick 1010
+check '[ "$POLLS" -eq 1 ] && [ "$LAST_POLL" -eq 1000 ]' "failed send doesn't re-poll every tick"
+touch "$REFRESH_FLAG"; mqtt_tick 1015
+check '[ "$POLLS" -eq 2 ] && [ ! -f "$REFRESH_FLAG" ]' "refresh request polls right away"
+
 MOSQ="$(clawd_find_tool mosquitto)" || { echo "SKIP: publish test (mosquitto not installed)"; exit $fail; }
 BROKER_DIR="$TMP/b"
 CLAWD_BROKER_PORT=18934 bash "$HERE/../broker/broker-init.sh" "$BROKER_DIR" >/dev/null

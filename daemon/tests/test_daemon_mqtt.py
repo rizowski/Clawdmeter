@@ -30,6 +30,8 @@ def test_transport_ignores_unknown_values(tmp_path, monkeypatch):
 class FakePublisher:
     instances = []
 
+    connected = True
+
     def __init__(self, env, loop, on_refresh, log=print):
         self.on_refresh = on_refresh
         self.published = []
@@ -41,6 +43,9 @@ class FakePublisher:
 
     def stop(self):
         self.stopped = True
+
+    def is_connected(self):
+        return FakePublisher.connected
 
     def publish_usage(self, device_ids, payload):
         self.published.append((list(device_ids), payload))
@@ -90,3 +95,32 @@ def test_run_mqtt_signals_no_data_when_tokens_dead(monkeypatch):
 def test_run_mqtt_refresh_request_triggers_immediate_poll(monkeypatch):
     pub = _run_until(2, [({"s": 1, "ok": True}, False), ({"s": 2, "ok": True}, False)], monkeypatch)
     assert [p for _d, p in pub.published] == [{"s": 1, "ok": True}, {"s": 2, "ok": True}]
+
+
+def test_run_mqtt_does_not_poll_anthropic_while_broker_is_down(monkeypatch):
+    # A missing/crashed broker must not turn into one API call every TICK.
+    FakePublisher.instances.clear()
+    FakePublisher.connected = False
+    polls = []
+
+    async def counting_poll(*_a):
+        polls.append(1)
+        return ({"s": 1, "ok": True}, False)
+
+    monkeypatch.setattr(mod.mqtt_transport, "Publisher", FakePublisher)
+    monkeypatch.setattr(mod.mqtt_transport, "read_devices", lambda *_a: ["a1b2c3"])
+    monkeypatch.setattr(mod, "poll_active", counting_poll)
+    monkeypatch.setattr(mod, "TICK", 0.02)
+
+    async def scenario():
+        stop = asyncio.Event()
+        task = asyncio.create_task(mod.run_mqtt({"BROKER_PORT": "1", "DAEMON_PASS": "x"}, stop))
+        await asyncio.sleep(0.3)          # ~15 ticks
+        stop.set()
+        await asyncio.wait_for(task, 2)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        FakePublisher.connected = True
+    assert polls == []
