@@ -52,6 +52,15 @@ void net_up_arm(NetUpGate* g, uint32_t config_gen);
 // connected_gen: generation of the live MQTT session, 0 when not connected.
 bool net_up_take(NetUpGate* g, uint32_t connected_gen);
 
+// millis()-based deadline that survives the 49.7-day wrap. Always arm it from
+// the current time: a deadline left at 0 reads as "in the future" for the
+// whole stretch where (int32_t)millis() is negative (24.8-49.7 days uptime).
+struct NetTimer {
+    uint32_t due_ms;
+};
+void net_timer_arm(NetTimer* t, uint32_t now_ms, uint32_t delay_ms);
+bool net_timer_due(const NetTimer* t, uint32_t now_ms);
+
 // Device id = last 3 bytes of the 6-byte base MAC, lowercase hex. Callers pass
 // the 6-byte WiFi-STA MAC (esp_read_mac(..., ESP_MAC_WIFI_STA)), not the C6's
 // 8-byte EUI-64, which has an ff:fe filler in the middle.

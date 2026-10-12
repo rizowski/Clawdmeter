@@ -30,6 +30,7 @@ const char* net_get_data(void) { return ""; }
 #define NET_BUF_SIZE 512
 static const uint32_t REDISCOVER_AFTER_MS = 20000;  // broker unreachable this long → browse again
 static const uint32_t BROWSE_RETRY_MS     = 15000;  // between failed browses (laptop away)
+static const uint32_t REJOIN_AFTER_MS     = 60000;  // off WiFi this long → WiFi.begin again
 
 static TaskHandle_t  net_task_h = nullptr;
 static portMUX_TYPE  mux = portMUX_INITIALIZER_UNLOCKED;
@@ -45,6 +46,9 @@ static uint32_t          pending_gen = 0;      // bumped by every net_apply_conf
 static volatile uint32_t applied_gen = 0;      // generation the net task is running
 static volatile uint32_t connected_gen = 0;    // generation of the live MQTT session
 
+static bool     mdns_up = false;   // net task only
+static NetTimer browse_timer = {};
+static NetTimer rejoin_timer = {};
 static NetConfig pending = {};   // written by the loop task under mux
 static NetConfig active  = {};   // net task's private copy
 static esp_mqtt_client_handle_t client = nullptr;
@@ -148,6 +152,12 @@ static void apply_pending(void) {
     portEXIT_CRITICAL(&mux);
     mqtt_stop();
     auth_failed = false;
+    // WiFi.disconnect(true) tears down the STA netif, and mDNS stays bound to
+    // the old one — restart it on the next connect or discovery never answers.
+    if (mdns_up) {
+        MDNS.end();
+        mdns_up = false;
+    }
     WiFi.disconnect(true);
     if (!netcfg_is_valid(&active)) {
         Serial.println("NET: no config — WiFi off");
@@ -161,23 +171,28 @@ static void apply_pending(void) {
     WiFi.setHostname(hostname);
     WiFi.setAutoReconnect(true);
     WiFi.begin(active.ssid, active.wpass);
+    net_timer_arm(&rejoin_timer, millis(), REJOIN_AFTER_MS);
+    net_timer_arm(&browse_timer, millis(), 0);
     Serial.printf("NET: joining \"%s\"\n", active.ssid);
 }
 
 static void net_task(void*) {
-    bool mdns_up = false;
-    uint32_t next_browse = 0;
     for (;;) {
-        if (reconfig) {
-            apply_pending();
-            next_browse = 0;
-        }
+        if (reconfig) apply_pending();
         if (!netcfg_is_valid(&active)) {
             state = NET_OFF;
         } else if (WiFi.status() != WL_CONNECTED) {
             state = NET_WIFI;
             if (client) mqtt_stop();
+            // The core gives up after an auth failure (not a "reconnectable"
+            // reason), so a brief AP hiccup would strand us until reboot.
+            if (net_timer_due(&rejoin_timer, millis())) {
+                Serial.println("NET: still off WiFi — retrying join");
+                WiFi.begin(active.ssid, active.wpass);
+                net_timer_arm(&rejoin_timer, millis(), REJOIN_AFTER_MS);
+            }
         } else {
+            net_timer_arm(&rejoin_timer, millis(), REJOIN_AFTER_MS);
             if (!mdns_up) mdns_up = MDNS.begin(hostname);
             if (mqtt_up) {
                 state = NET_CONNECTED;
@@ -186,13 +201,13 @@ static void net_task(void*) {
                 // No client yet, or the broker has been unreachable for a while
                 // (laptop left, or came back on a new IP): browse again.
                 bool stale = client && (millis() - mqtt_down_since) > REDISCOVER_AFTER_MS;
-                if ((!client || stale) && (int32_t)(millis() - next_browse) >= 0) {
+                if ((!client || stale) && net_timer_due(&browse_timer, millis())) {
                     mqtt_stop();
                     IPAddress ip;
                     uint16_t port;
                     if (discover(&ip, &port)) mqtt_start(ip, port);
                     else Serial.println("NET: broker not found on mDNS");
-                    next_browse = millis() + BROWSE_RETRY_MS;
+                    net_timer_arm(&browse_timer, millis(), BROWSE_RETRY_MS);
                 }
             }
         }

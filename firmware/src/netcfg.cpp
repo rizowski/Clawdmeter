@@ -87,6 +87,14 @@ bool net_up_take(NetUpGate* g, uint32_t connected_gen) {
     return true;
 }
 
+void net_timer_arm(NetTimer* t, uint32_t now_ms, uint32_t delay_ms) {
+    t->due_ms = now_ms + delay_ms;
+}
+
+bool net_timer_due(const NetTimer* t, uint32_t now_ms) {
+    return (int32_t)(now_ms - t->due_ms) >= 0;
+}
+
 void netcfg_device_id(const uint8_t base_mac[6], char out[7]) {
     snprintf(out, 7, "%02x%02x%02x", base_mac[3], base_mac[4], base_mac[5]);
 }

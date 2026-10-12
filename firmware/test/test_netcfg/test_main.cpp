@@ -165,6 +165,25 @@ static void should_report_net_up_only_for_the_config_just_applied() {
     CHECK(!net_up_take(&g, 2));   // reported once
 }
 
+static void should_fire_an_armed_timer_past_the_int32_millis_boundary() {
+    // Uptime 24.8-49.7 days: (int32_t)millis() is negative, so a deadline left
+    // at 0 never comes due there. Timers must be armed from "now".
+    const uint32_t now = 0x90000000u;
+    NetTimer t = {};
+    net_timer_arm(&t, now, 0);
+    CHECK(net_timer_due(&t, now));
+    net_timer_arm(&t, now, 15000);
+    CHECK(!net_timer_due(&t, now + 14999));
+    CHECK(net_timer_due(&t, now + 15000));
+}
+
+static void should_fire_a_timer_across_the_millis_wrap() {
+    NetTimer t = {};
+    net_timer_arm(&t, 0xFFFFF000u, 0x2000);
+    CHECK(!net_timer_due(&t, 0xFFFFFFFFu));
+    CHECK(net_timer_due(&t, 0x00001000u));
+}
+
 int main() {
     should_parse_config_with_json_hostile_chars();
     should_accept_max_length_ssid_and_pass_and_reject_longer();
@@ -182,6 +201,8 @@ int main() {
     should_refuse_begin_during_lockout_then_allow_after();
     should_reset_wrong_code_count_after_success();
     should_report_net_up_only_for_the_config_just_applied();
+    should_fire_an_armed_timer_past_the_int32_millis_boundary();
+    should_fire_a_timer_across_the_millis_wrap();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all netcfg tests passed\n");
     return 0;
