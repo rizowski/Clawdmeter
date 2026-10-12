@@ -4,6 +4,7 @@ hardware check in the plan).
 
 Run: daemon/.venv/bin/python -m pytest daemon/tests/test_setup_cli.py -x -q
 """
+import asyncio
 import json
 import socket
 import subprocess
@@ -91,3 +92,87 @@ def test_broker_reachable():
     assert s.broker_reachable(port)
     srv.close()
     assert not s.broker_reachable(port)
+
+
+# ---------------------------------------------------------------- provision flow
+
+class FakeLink:
+    """Scripted PROV replies; records what the CLI sent."""
+    replies: list = []
+    sent: list = []
+
+    def __init__(self, _client):
+        pass
+
+    async def start(self):
+        pass
+
+    async def send(self, msg):
+        FakeLink.sent.append(msg)
+
+    async def recv(self, _timeout):
+        if not FakeLink.replies:
+            raise asyncio.TimeoutError
+        return FakeLink.replies.pop(0)
+
+
+class FakeClient:
+    def __init__(self, _target):
+        pass
+
+    async def connect(self):
+        pass
+
+    async def disconnect(self):
+        pass
+
+
+def _provision(monkeypatch, tmp_path, replies, codes):
+    import argparse
+    FakeLink.replies = list(replies)
+    FakeLink.sent = []
+    added = []
+    monkeypatch.setattr(s, "ProvLink", FakeLink)
+    monkeypatch.setattr(s, "BleakClient", FakeClient)
+    monkeypatch.setattr(s.mqtt_transport, "read_broker_env",
+                        lambda *_a: {"BROKER_ID": "00aa11bb22cc33dd", "BROKER_PORT": "1", "DAEMON_PASS": "x"})
+    monkeypatch.setattr(s.mqtt_transport, "find_tool", lambda _n: "/bin/true")
+    monkeypatch.setattr(s, "broker_reachable", lambda _p: True)
+    monkeypatch.setattr(s, "add_device", lambda *a: added.append(a[1]))
+    monkeypatch.setattr(s, "upsert_config_key", lambda *a: None)
+    monkeypatch.setattr(s, "restart_daemon", lambda: True)
+    monkeypatch.setattr(s, "NET_UP_TIMEOUT", 0.01)
+
+    async def fake_target(*_a, **_k):
+        return "AA:BB:CC:DD:EE:FF"
+    monkeypatch.setattr(s.daemon_core, "discover_target", fake_target)
+    monkeypatch.setattr(s.getpass, "getpass", lambda _p: "wifipass")
+    answers = iter(codes)
+
+    def fake_input(_p):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise KeyboardInterrupt
+    monkeypatch.setattr("builtins.input", fake_input)
+    try:
+        rc = asyncio.run(s.provision(argparse.Namespace(ssid="Home")))
+    except KeyboardInterrupt:
+        rc = 130
+    return rc, added
+
+
+def test_aborted_rerun_leaves_working_device_password_alone(monkeypatch, tmp_path):
+    # Wrong code, then the user quits: the device's broker password must not
+    # have been replaced, or a device that was working stops connecting.
+    rc, added = _provision(monkeypatch, tmp_path,
+                           [{"id": "a1b2c3"}, {"err": "code"}], ["111111"])
+    assert rc != 0
+    assert added == []
+
+
+def test_device_added_to_broker_after_code_accepted(monkeypatch, tmp_path):
+    rc, added = _provision(monkeypatch, tmp_path,
+                           [{"id": "a1b2c3"}, {"ok": True}, {"net": "up"}], ["123456"])
+    assert rc == 0
+    assert added == ["a1b2c3"]

@@ -202,7 +202,6 @@ async def provision(args) -> int:
         ssid = args.ssid or prompt_default("WiFi network", detect_ssid())
         wpass = getpass.getpass(f"Password for {ssid} (blank if open): ")
         password = secrets.token_urlsafe(18)   # 24 chars
-        add_device(mqtt_transport.BROKER_DIR, device_id, password, passwd_tool)
 
         for _ in range(MAX_CODE_TRIES):
             code = input("Code shown on the device: ").strip().replace(" ", "")
@@ -229,6 +228,9 @@ async def provision(args) -> int:
         else:
             return 1
 
+        # Only now — code accepted, device saved the config — swap the broker
+        # password. An aborted re-run must not break a device that was working.
+        add_device(mqtt_transport.BROKER_DIR, device_id, password, passwd_tool)
         print("Saved. Waiting for the device to join WiFi and reach the broker...")
         try:
             while (await link.recv(NET_UP_TIMEOUT)).get("net") != "up":
