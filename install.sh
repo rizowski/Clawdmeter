@@ -130,7 +130,7 @@ configure_chime() {
 configure_wifi_transport() {
     [ -t 0 ] || return 0
     local ans venv="$SCRIPT_DIR/daemon/.venv"
-    read -r -p "  Enable WiFi transport (MQTT; S3 boards only)? [y/N] " ans || ans=""
+    read -r -p "  Enable WiFi transport (MQTT)? [y/N] " ans || ans=""
     [[ "$ans" =~ ^[Yy]$ ]] || { echo "  WiFi transport skipped (Bluetooth only)."; return 0; }
     sudo apt-get install -y mosquitto mosquitto-clients avahi-utils python3-venv
     bash "$SCRIPT_DIR/daemon/broker/broker-init.sh"

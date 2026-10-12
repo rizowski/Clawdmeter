@@ -265,10 +265,11 @@ Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic
 - `...0003` TX — firmware notifies ack/nack (daemon doesn't subscribe).
 - `...0004` REQ — firmware fires `0x01` notify in `onSubscribe` if `has_received_data` is false. Daemon subscribes via `setsid bash -c "stdbuf -oL dbus-monitor … | awk …"`; awk drops a flag file the inner loop picks up. See the `feedback_dbus_monitor_pipe` memory for the three subtle gotchas (pipe buffering, busctl-exits race, `wait` blocking on pipeline jobs).
 
-**WiFi/MQTT transport (S3 boards only, `BOARD_HAS_WIFI`):**
+**WiFi/MQTT transport (all S3 + C6 boards, `BOARD_HAS_WIFI`):**
 
 - The daemon hosts mosquitto on **port 18830** with state in `~/.config/claude-usage-monitor/broker/`, created by `daemon/broker/broker-init.sh`. It announces `_clawdmeter._tcp` with TXT `id=<BROKER_ID>`. Security is passwords + ACL with no TLS, a deliberate choice. Passwords never go in argv: `mosquitto_passwd` reads stdin and clients use `-o client.conf`.
 - Device id = last 3 bytes of the **WiFi-STA MAC** (`esp_read_mac`). On the C6, `ESP.getEfuseMac()` returns an EUI-64 with `ff:fe` in it. The device id is also the MQTT username, so ACL `%u` patterns pin each device to `clawdmeter/<id>/…`.
 - `daemon/clawdmeter-setup` asks the device for a code over the BLE PROV char (`…0005`), adds the device to the broker, pushes WiFi + broker info, waits for `{"net":"up"}`, then sets `transport = mqtt` and restarts the daemon. After 5 wrong codes, `begin` is locked out for 60 s.
+- C6 (no PSRAM): WiFi + BLE + LVGL fit (120 KB free heap at boot). Its splash draws straight to the panel, so `splash_set_covered()` pauses it under the setup-code overlay.
 - `net.cpp` re-runs mDNS discovery after the broker has been unreachable for 20 s, retrying every 15 s. That is the walk-away / come-back path. `usage` is retained, so a reconnect shows current data immediately.
 - Serial dev commands: `prov {json}` sets the config without a code, `provbegin` shows a code, `provclear` forgets WiFi but keeps the BLE bond. Hold-to-pair clears both the BLE bond and WiFi.

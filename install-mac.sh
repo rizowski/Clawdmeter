@@ -220,7 +220,7 @@ echo ""
 configure_wifi_transport() {
     [ -t 0 ] || return 0
     local ans
-    read -r -p "  Enable WiFi transport (MQTT; S3 boards only)? [y/N] " ans || ans=""
+    read -r -p "  Enable WiFi transport (MQTT)? [y/N] " ans || ans=""
     [[ "$ans" =~ ^[Yy]$ ]] || { echo "  WiFi transport skipped (Bluetooth only)."; return 0; }
     if ! command -v mosquitto_passwd >/dev/null 2>&1; then
         command -v brew >/dev/null 2>&1 || { echo "  Homebrew is needed to install mosquitto; skipping."; return 0; }

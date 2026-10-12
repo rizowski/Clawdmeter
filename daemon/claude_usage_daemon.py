@@ -844,7 +844,7 @@ async def find_held_device():
 class OpportunisticBle:
     """Best-effort BLE copy of each payload while the daemon is in MQTT mode.
 
-    Keeps devices that aren't on WiFi fed: a C6, a device just factory-reset,
+    Keeps devices that aren't on WiFi fed: one not set up yet, one just factory-reset,
     or one whose WiFi change failed. No reconnect loop and no API poll of its
     own: each send looks once for a device the OS already holds, reuses an
     open session, and drops it on any error.

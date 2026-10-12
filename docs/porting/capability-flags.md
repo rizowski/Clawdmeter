@@ -23,7 +23,7 @@ Keep the two in sync. The pattern in `caps.cpp` does this for you:
 | `BOARD_HAS_IMU`                | 0       | Whether the accelerometer is populated and initialized. Distinct from `BOARD_HAS_ROTATION` — the AMOLED-1.8 has the QMI8658 (so `HAS_IMU=1`) but the kit's enclosure mounts the panel at a fixed orientation, so rotation is off. |
 | `BOARD_HAS_BATTERY`            | 0       | Whether PMU battery measurement is meaningful on this board. UI hides the battery indicator when false. |
 | `BOARD_HAS_IO_EXPANDER`        | 0       | Whether an IO expander gates display / touch reset lines. Doesn't directly gate any code path — but signals to the porter that `board_init()` must release the expander before `display_hal_init()`. |
-| `BOARD_HAS_WIFI`               | 0       | Set as a `-D` flag in `platformio.ini` (like `BOARD_HAS_PSRAM`). Enables the WiFi + MQTT transport (`net.cpp`, PROV `begin`). Leave undefined on PSRAM-less chips (C6): WiFi + BLE + LVGL don't fit internal SRAM there yet. Without it `net.cpp` compiles to stubs and PROV replies `{"err":"nowifi"}`. |
+| `BOARD_HAS_WIFI`               | 0       | Set as a `-D` flag in `platformio.ini` (like `BOARD_HAS_PSRAM`). Enables the WiFi + MQTT transport (`net.cpp`, PROV `begin`). Set on every hardware board, C6 included (WiFi + BLE + LVGL fit its internal SRAM); leave it off for chips without a WiFi radio. Without it `net.cpp` compiles to stubs and PROV replies `{"err":"nowifi"}`. |
 
 ## Build-flag macros
 

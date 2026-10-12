@@ -195,9 +195,9 @@ your computer. It finds that broker with mDNS, so when you come back the screen
 catches up within about 20 seconds without you touching anything. Bluetooth
 stays on for the Space / Shift+Tab buttons. The daemon also sends each update
 over Bluetooth to any device the computer has connected, so a device that is
-not on WiFi (a C6 board, or one you just reset) still gets data.
+not on WiFi (one you just reset, or one not set up yet) still gets data.
 
-Only the ESP32-S3 boards support this. The C6 boards stay on Bluetooth.
+All supported boards (ESP32-S3 and ESP32-C6) can use WiFi. 2.4 GHz networks only.
 
 1. Run the installer for your OS and answer **y** to "Enable WiFi transport".
    This installs mosquitto and creates the broker settings in
