@@ -66,7 +66,7 @@ def _run_until(stop_after_publishes, payloads, monkeypatch, devices=("a1b2c3",))
 
     async def scenario():
         stop = asyncio.Event()
-        task = asyncio.create_task(mod.run_mqtt({"BROKER_PORT": "1", "DAEMON_PASS": "x"}, stop))
+        task = asyncio.create_task(mod.run_mqtt({"BROKER_PORT": "1", "DAEMON_PASS": "x"}, stop, ble=RecordingBle()))
         for _ in range(100):
             await asyncio.sleep(0.02)
             pubs = FakePublisher.instances[0].published if FakePublisher.instances else []
@@ -97,8 +97,9 @@ def test_run_mqtt_refresh_request_triggers_immediate_poll(monkeypatch):
     assert [p for _d, p in pub.published] == [{"s": 1, "ok": True}, {"s": 2, "ok": True}]
 
 
-def test_run_mqtt_does_not_poll_anthropic_while_broker_is_down(monkeypatch):
+def test_run_mqtt_polls_at_most_once_per_interval_while_broker_is_down(monkeypatch):
     # A missing/crashed broker must not turn into one API call every TICK.
+    # (One poll still happens: its payload goes out over the BLE fallback.)
     FakePublisher.instances.clear()
     FakePublisher.connected = False
     polls = []
@@ -114,7 +115,7 @@ def test_run_mqtt_does_not_poll_anthropic_while_broker_is_down(monkeypatch):
 
     async def scenario():
         stop = asyncio.Event()
-        task = asyncio.create_task(mod.run_mqtt({"BROKER_PORT": "1", "DAEMON_PASS": "x"}, stop))
+        task = asyncio.create_task(mod.run_mqtt({"BROKER_PORT": "1", "DAEMON_PASS": "x"}, stop, ble=RecordingBle()))
         await asyncio.sleep(0.3)          # ~15 ticks
         stop.set()
         await asyncio.wait_for(task, 2)
@@ -123,4 +124,139 @@ def test_run_mqtt_does_not_poll_anthropic_while_broker_is_down(monkeypatch):
         asyncio.run(scenario())
     finally:
         FakePublisher.connected = True
-    assert polls == []
+    assert polls == [1]
+
+
+# ------------------------------------------------- BLE fallback in MQTT mode
+
+class RecordingBle:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, payload):
+        self.sent.append(payload)
+        return True
+
+    async def close(self):
+        pass
+
+
+def test_run_mqtt_also_offers_each_payload_over_ble(monkeypatch):
+    # A device that isn't on WiFi (a C6, one just reset, a failed network
+    # change) still gets data over BLE while the daemon is in MQTT mode.
+    FakePublisher.instances.clear()
+    monkeypatch.setattr(mod.mqtt_transport, "Publisher", FakePublisher)
+    monkeypatch.setattr(mod.mqtt_transport, "read_devices", lambda *_a: ["a1b2c3"])
+    queue = [({"s": 9, "ok": True}, False)]
+
+    async def one_poll(*_a):
+        return queue.pop(0) if queue else (None, False)
+
+    monkeypatch.setattr(mod, "poll_active", one_poll)
+    monkeypatch.setattr(mod, "TICK", 0.02)
+    ble = RecordingBle()
+
+    async def scenario():
+        stop = asyncio.Event()
+        task = asyncio.create_task(mod.run_mqtt({"BROKER_PORT": "1", "DAEMON_PASS": "x"}, stop, ble=ble))
+        await asyncio.sleep(0.15)
+        stop.set()
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(scenario())
+    assert ble.sent == [{"s": 9, "ok": True}]
+
+
+def test_run_mqtt_offers_ble_even_with_no_wifi_devices(monkeypatch):
+    # e.g. the only WiFi device was factory-reset: the BLE path keeps it fed.
+    FakePublisher.instances.clear()
+    monkeypatch.setattr(mod.mqtt_transport, "Publisher", FakePublisher)
+    monkeypatch.setattr(mod.mqtt_transport, "read_devices", lambda *_a: [])
+    queue = [({"s": 4, "ok": True}, False)]
+
+    async def one_poll(*_a):
+        return queue.pop(0) if queue else (None, False)
+
+    monkeypatch.setattr(mod, "poll_active", one_poll)
+    monkeypatch.setattr(mod, "TICK", 0.02)
+    ble = RecordingBle()
+
+    async def scenario():
+        stop = asyncio.Event()
+        task = asyncio.create_task(mod.run_mqtt({"BROKER_PORT": "1", "DAEMON_PASS": "x"}, stop, ble=ble))
+        await asyncio.sleep(0.15)
+        stop.set()
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(scenario())
+    assert ble.sent == [{"s": 4, "ok": True}]
+
+
+class FakeBleak:
+    writes = []
+    fail_write = False
+
+    def __init__(self, target):
+        self.target = target
+        self.is_connected = False
+
+    async def connect(self):
+        self.is_connected = True
+
+    async def write_gatt_char(self, _uuid, data, response=False):
+        if FakeBleak.fail_write:
+            raise mod.BleakError("link dropped")
+        FakeBleak.writes.append(data)
+
+    async def disconnect(self):
+        self.is_connected = False
+
+
+def test_opportunistic_ble_never_scans_and_skips_when_os_holds_nothing(monkeypatch):
+    async def held(*_a, **_k):
+        return None
+    monkeypatch.setattr(mod, "find_held_device", held)
+    monkeypatch.setattr(mod, "BleakClient", FakeBleak)
+    FakeBleak.writes = []
+    assert asyncio.run(mod.OpportunisticBle().send({"s": 1})) is False
+    assert FakeBleak.writes == []
+
+
+def test_opportunistic_ble_writes_and_reuses_the_session(monkeypatch):
+    calls = []
+
+    async def held(*_a, **_k):
+        calls.append(1)
+        return "AA:BB:CC:DD:EE:FF"
+    monkeypatch.setattr(mod, "find_held_device", held)
+    monkeypatch.setattr(mod, "BleakClient", FakeBleak)
+    FakeBleak.writes = []
+    FakeBleak.fail_write = False
+
+    async def scenario():
+        ble = mod.OpportunisticBle()
+        assert await ble.send({"s": 1})
+        assert await ble.send({"s": 2})
+
+    asyncio.run(scenario())
+    assert FakeBleak.writes == [b'{"s":1}', b'{"s":2}']
+    assert len(calls) == 1          # connected once, then reused
+
+
+def test_opportunistic_ble_drops_the_session_after_a_failed_write(monkeypatch):
+    async def held(*_a, **_k):
+        return "AA:BB:CC:DD:EE:FF"
+    monkeypatch.setattr(mod, "find_held_device", held)
+    monkeypatch.setattr(mod, "BleakClient", FakeBleak)
+    FakeBleak.writes = []
+
+    async def scenario():
+        ble = mod.OpportunisticBle()
+        FakeBleak.fail_write = True
+        assert await ble.send({"s": 1}) is False
+        assert ble.client is None
+        FakeBleak.fail_write = False
+        assert await ble.send({"s": 2})
+
+    asyncio.run(scenario())
+    assert FakeBleak.writes == [b'{"s":2}']

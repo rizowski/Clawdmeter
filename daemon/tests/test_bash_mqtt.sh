@@ -37,6 +37,26 @@ check '[ "$POLLS" -eq 1 ] && [ "$LAST_POLL" -eq 1000 ]' "failed send doesn't re-
 touch "$REFRESH_FLAG"; mqtt_tick 1015
 check '[ "$POLLS" -eq 2 ] && [ ! -f "$REFRESH_FLAG" ]' "refresh request polls right away"
 
+# MQTT mode still offers each payload over BLE, for devices not on WiFi.
+eval "$(extract send_payload)"
+eval "$(extract ble_opportunistic_send)"
+SENT=""
+mqtt_publish() { SENT="$SENT mqtt"; return 1; }       # broker down
+load_mac() { DEVICE_MAC="AA:BB:CC:DD:EE:FF"; return 0; }
+is_connected() { return 0; }
+find_char_path_by_uuid() { echo "/org/bluez/hci0/dev_X/service1/char2"; }
+write_gatt() { SENT="$SENT ble:$2"; }
+TRANSPORT=mqtt
+RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
+send_payload '{"s":3}'; rc=$?
+check '[ "$SENT" = " mqtt ble:{\"s\":3}" ]' "mqtt mode also writes over BLE when a device is connected"
+check '[ $rc -ne 0 ]' "send_payload still reports the MQTT failure"
+SENT=""
+is_connected() { return 1; }
+send_payload '{"s":4}'
+check '[ "$SENT" = " mqtt" ]' "no BLE write (and no connect attempt) when nothing is connected"
+eval "$(extract mqtt_publish)"   # restore the real one for the live checks
+
 MOSQ="$(clawd_find_tool mosquitto)" || { echo "SKIP: publish test (mosquitto not installed)"; exit $fail; }
 BROKER_DIR="$TMP/b"
 CLAWD_BROKER_PORT=18934 bash "$HERE/../broker/broker-init.sh" "$BROKER_DIR" >/dev/null

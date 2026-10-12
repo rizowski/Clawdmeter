@@ -831,14 +831,65 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     return used_successfully
 
 
-async def run_mqtt(env: dict, stop_event: asyncio.Event) -> None:
+async def find_held_device():
+    """A device the OS already holds (macOS) or has pinned (Linux), else None.
+
+    Never scans and never logs a miss — the MQTT loop calls this once per poll.
+    """
+    if sys.platform == "darwin":
+        return await retrieve_connected_macos()
+    return load_cached_address()
+
+
+class OpportunisticBle:
+    """Best-effort BLE copy of each payload while the daemon is in MQTT mode.
+
+    Keeps devices that aren't on WiFi fed: a C6, a device just factory-reset,
+    or one whose WiFi change failed. No reconnect loop and no API poll of its
+    own: each send looks once for a device the OS already holds, reuses an
+    open session, and drops it on any error.
+    """
+
+    def __init__(self) -> None:
+        self.client: BleakClient | None = None
+
+    async def send(self, payload: dict) -> bool:
+        try:
+            if self.client is None or not self.client.is_connected:
+                self.client = None
+                target = await find_held_device()
+                if target is None:
+                    return False
+                client = BleakClient(target)
+                await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
+                self.client = client
+            data = json.dumps(payload, separators=(",", ":")).encode()
+            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            return True
+        except (BleakError, asyncio.TimeoutError, OSError) as e:
+            log(f"BLE fallback skipped: {e}")
+            await self.close()
+            return False
+
+    async def close(self) -> None:
+        if self.client is not None:
+            try:
+                await self.client.disconnect()
+            except (BleakError, OSError):
+                pass
+            self.client = None
+
+
+async def run_mqtt(env: dict, stop_event: asyncio.Event, ble: "OpportunisticBle | None" = None) -> None:
     """Poll Anthropic and publish to every set-up device over the local broker.
 
     The broker keeps the last payload retained, so a device that walks back
     into range gets current numbers the moment it reconnects; its refresh
-    request then triggers a fresh poll right away.
+    request then triggers a fresh poll right away. Each payload is also
+    offered over BLE (see OpportunisticBle) for devices not on WiFi.
     """
     refresh = asyncio.Event()
+    ble = ble if ble is not None else OpportunisticBle()
 
     def _on_refresh(device_id: str) -> None:
         log(f"Refresh requested by {device_id}")
@@ -851,35 +902,32 @@ async def run_mqtt(env: dict, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             if refresh.is_set() or time.time() - last_poll >= POLL_INTERVAL:
                 refresh.clear()
-                devices = mqtt_transport.read_devices()
-                if not pub.is_connected():
-                    # Broker down (or paho still reconnecting): skip the API
-                    # call — nothing could be delivered, and polling every TICK
-                    # would hammer the API. Retry next tick. (Refresh requests
-                    # arrive through the broker, so none are lost.)
-                    pass
-                elif not devices:
-                    log("No WiFi devices set up yet; run daemon/clawdmeter-setup")
-                    last_poll = time.time()
+                # Same free-ride token policy as the BLE path (see connect_and_run).
+                payload, dead = await poll_active()
+                if payload is None and dead:
+                    log("No usable token; signalling no-data to devices")
+                    payload = {"ok": False}
+                if payload is None:
+                    log("No usable config dir this cycle")   # transient: retry next tick
                 else:
-                    # Same free-ride token policy as the BLE path (see connect_and_run).
-                    payload, dead = await poll_active()
-                    if payload is not None:
+                    # Counts as a poll whether or not MQTT delivered it: a
+                    # broker outage costs one API call per POLL_INTERVAL, and
+                    # the BLE copy still goes out.
+                    last_poll = time.time()
+                    devices = mqtt_transport.read_devices()
+                    if devices and pub.is_connected():
                         log(f"Publishing: {json.dumps(payload, separators=(',', ':'))}")
-                        if pub.publish_usage(devices, payload):
-                            last_poll = time.time()
-                    elif dead:
-                        log("No usable token; signalling no-data to devices")
-                        if pub.publish_usage(devices, {"ok": False}):
-                            last_poll = time.time()
-                    else:
-                        log("No usable config dir this cycle")
+                        pub.publish_usage(devices, payload)
+                    elif devices:
+                        log("Broker not connected; MQTT copy skipped this cycle")
+                    await ble.send(payload)
             try:
                 await asyncio.wait_for(refresh.wait(), timeout=TICK)
             except asyncio.TimeoutError:
                 pass
     finally:
         pub.stop()
+        await ble.close()
 
 
 async def run_ble(stop_event: asyncio.Event) -> None:

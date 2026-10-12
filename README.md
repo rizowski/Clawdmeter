@@ -193,7 +193,9 @@ Bluetooth links can drop when your laptop leaves the room and don't always come
 back. With WiFi, the device talks to a small MQTT broker that the daemon runs on
 your computer. It finds that broker with mDNS, so when you come back the screen
 catches up within about 20 seconds without you touching anything. Bluetooth
-stays on for the Space / Shift+Tab buttons.
+stays on for the Space / Shift+Tab buttons. The daemon also sends each update
+over Bluetooth to any device the computer has connected, so a device that is
+not on WiFi (a C6 board, or one you just reset) still gets data.
 
 Only the ESP32-S3 boards support this. The C6 boards stay on Bluetooth.
 

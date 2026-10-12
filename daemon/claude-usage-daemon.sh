@@ -346,9 +346,24 @@ mqtt_publish() {
     return $rc
 }
 
+# Best-effort BLE copy in MQTT mode, for devices not on WiFi (a C6, one just
+# factory-reset, a failed network change). Only writes to a device the system
+# already has connected: no scanning, no connect attempts, no retries.
+ble_opportunistic_send() {
+    load_mac || return 0
+    is_connected || return 0
+    local path
+    path=$(find_char_path_by_uuid "$RX_CHAR_UUID")
+    [ -n "$path" ] || return 0
+    write_gatt "$path" "$1" >/dev/null 2>&1 || true
+}
+
 send_payload() {
     if [ "$TRANSPORT" = mqtt ]; then
-        mqtt_publish "$1"
+        local rc=0
+        mqtt_publish "$1" || rc=1
+        ble_opportunistic_send "$1"
+        return $rc
     else
         write_gatt "$RX_CHAR_PATH" "$1"
     fi
