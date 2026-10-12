@@ -102,3 +102,7 @@ void netcfg_device_id(const uint8_t base_mac[6], char out[7]) {
 void netcfg_topic(char* out, size_t n, const char* device_id, const char* leaf) {
     snprintf(out, n, "clawdmeter/%s/%s", device_id, leaf);
 }
+
+bool netcfg_broker_usable(uint32_t ipv4, uint16_t port) {
+    return ipv4 != 0 && port != 0;
+}

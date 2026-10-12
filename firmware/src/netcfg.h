@@ -66,5 +66,9 @@ bool net_timer_due(const NetTimer* t, uint32_t now_ms);
 // 8-byte EUI-64, which has an ff:fe filler in the middle.
 void netcfg_device_id(const uint8_t base_mac[6], char out[7]);
 
+// An mDNS answer can arrive before its A record resolves (address 0.0.0.0).
+// Connecting there fails until the next rediscover, so skip such answers.
+bool netcfg_broker_usable(uint32_t ipv4, uint16_t port);
+
 // "clawdmeter/<device_id>/<leaf>"
 void netcfg_topic(char* out, size_t n, const char* device_id, const char* leaf);

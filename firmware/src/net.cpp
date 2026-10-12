@@ -114,7 +114,8 @@ static void mqtt_stop(void) {
 static bool discover(IPAddress* ip, uint16_t* port) {
     int n = MDNS.queryService("clawdmeter", "tcp");
     for (int i = 0; i < n; i++) {
-        if (MDNS.txt(i, "id") == active.broker_id) {
+        if (MDNS.txt(i, "id") == active.broker_id &&
+            netcfg_broker_usable((uint32_t)MDNS.address(i), MDNS.port(i))) {
             *ip = MDNS.address(i);
             *port = MDNS.port(i);
             return true;

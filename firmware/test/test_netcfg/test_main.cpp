@@ -189,6 +189,13 @@ static void should_fire_a_timer_across_the_millis_wrap() {
     CHECK(net_timer_due(&t, 0x00001000u));
 }
 
+static void should_skip_an_mdns_answer_whose_address_is_unresolved() {
+    // ESPmDNS can return the service before its A record: address 0.0.0.0.
+    CHECK(!netcfg_broker_usable(0, 18830));
+    CHECK(!netcfg_broker_usable(0xF802A8C0u, 0));      // 192.168.2.248, no port
+    CHECK(netcfg_broker_usable(0xF802A8C0u, 18830));
+}
+
 int main() {
     should_parse_config_with_json_hostile_chars();
     should_accept_max_length_ssid_and_pass_and_reject_longer();
@@ -208,6 +215,7 @@ int main() {
     should_report_net_up_only_for_the_config_just_applied();
     should_fire_an_armed_timer_past_the_int32_millis_boundary();
     should_fire_a_timer_across_the_millis_wrap();
+    should_skip_an_mdns_answer_whose_address_is_unresolved();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all netcfg tests passed\n");
     return 0;
