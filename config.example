@@ -1,0 +1,6 @@
+
+# How usage reaches the device.
+#   ble  = Bluetooth (default)
+#   mqtt = WiFi via the daemon's local MQTT broker. Don't set this by hand:
+#          run daemon/clawdmeter-setup, which sets it once the device is online.
+# transport = ble

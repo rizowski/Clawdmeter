@@ -123,6 +123,23 @@ configure_chime() {
     fi
 }
 
+# Optional WiFi transport: a local password-protected MQTT broker the daemon
+# hosts on port 18830. The distro's own mosquitto service is left alone — it
+# listens on 1883, so the two don't clash. Devices are then set up with
+# daemon/clawdmeter-setup, which needs a Python venv with bleak.
+configure_wifi_transport() {
+    [ -t 0 ] || return 0
+    local ans venv="$SCRIPT_DIR/daemon/.venv"
+    read -r -p "  Enable WiFi transport (MQTT; S3 boards only)? [y/N] " ans || ans=""
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "  WiFi transport skipped (Bluetooth only)."; return 0; }
+    sudo apt-get install -y mosquitto mosquitto-clients avahi-utils python3-venv
+    bash "$SCRIPT_DIR/daemon/broker/broker-init.sh"
+    [ -d "$venv" ] || python3 -m venv "$venv"
+    "$venv/bin/pip" install --quiet "bleak>=0.22" "httpx>=0.27" "paho-mqtt>=2.0" "zeroconf>=0.132"
+    WIFI_ENABLED=1
+}
+WIFI_ENABLED=0
+
 echo "=== Claude Usage Tracker - Install ==="
 echo ""
 
@@ -147,6 +164,7 @@ echo "[3/4] Configuring the daemon..."
 configure_config_dirs
 configure_clock
 configure_chime
+configure_wifi_transport
 echo ""
 
 # Enable service
@@ -157,16 +175,22 @@ echo ""
 echo "=== Done! ==="
 echo ""
 echo "The daemon will now start automatically when you log in"
-echo "and connect to the SC01 Plus over Bluetooth Low Energy."
+echo "and connect to the Clawdmeter over Bluetooth Low Energy."
 echo ""
 echo "First-time Bluetooth pairing:"
-echo "  1. Power on the SC01 Plus"
+echo "  1. Power on the Clawdmeter"
 echo "  2. Run: bluetoothctl scan le"
 echo "  3. Find 'Clawdmeter' and note the MAC address"
 echo "  4. Run: bluetoothctl pair <MAC>"
 echo "  5. Run: bluetoothctl trust <MAC>"
 echo "  6. Start the daemon: systemctl --user start $SERVICE_NAME"
 echo ""
+if [ "$WIFI_ENABLED" = 1 ]; then
+    echo "WiFi setup (after Bluetooth pairing, with the daemon running):"
+    echo "  $SCRIPT_DIR/daemon/clawdmeter-setup"
+    echo "  Type the 6-digit code the device shows."
+    echo ""
+fi
 echo "Useful commands:"
 echo "  systemctl --user status $SERVICE_NAME    # check status"
 echo "  journalctl --user -u $SERVICE_NAME -f    # view logs"

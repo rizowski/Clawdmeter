@@ -187,6 +187,42 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 | `Connection failed`                    | Toggle Windows Bluetooth off/on in Settings.             |
 | `Warning: running under Linux/WSL`     | Run from a native PowerShell window, not a WSL shell.    |
 
+## WiFi setup (optional, S3 boards)
+
+Bluetooth links can drop when your laptop leaves the room and don't always come
+back. With WiFi, the device talks to a small MQTT broker that the daemon runs on
+your computer. It finds that broker with mDNS, so when you come back the screen
+catches up within about 20 seconds without you touching anything. Bluetooth
+stays on for the Space / Shift+Tab buttons.
+
+Only the ESP32-S3 boards support this. The C6 boards stay on Bluetooth.
+
+1. Run the installer for your OS and answer **y** to "Enable WiFi transport".
+   This installs mosquitto and creates the broker settings in
+   `~/.config/claude-usage-monitor/broker/`.
+2. Pair the device over Bluetooth as usual and make sure the daemon is running.
+3. Run `daemon/clawdmeter-setup`. The device shows a 6-digit code. Type it in,
+   then confirm your WiFi network and enter its password.
+4. Wait for `Connected over WiFi.` The daemon restarts in MQTT mode by itself.
+
+To change networks, run `clawdmeter-setup` again. To reset the device, hold the
+power button for 3 seconds and release. This clears the Bluetooth pairing and
+the WiFi settings.
+
+**Security model.** Each device gets its own random MQTT password, and access
+rules limit it to its own topics. After 5 wrong setup codes, setup is locked for
+60 seconds. Some limits remain:
+
+- MQTT traffic, including the device's password, is not encrypted on your
+  network. The broker uses passwords, not TLS.
+- Another computer on your network can pretend to be the broker. The device
+  would then send it the device's MQTT password and show whatever numbers it
+  sends.
+- The WiFi and MQTT passwords are stored unencrypted in the device's flash.
+
+Your Anthropic token and your computer's credentials never leave your computer.
+The worst case is someone on your network reading or faking the usage numbers.
+
 ## How it works
 
 <img src="assets/readme/magnifier.gif" width="150" align="right" alt="">
@@ -194,7 +230,7 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 1. The daemon reads your Claude Code OAuth token — from the macOS Keychain (service `Claude Code-credentials`) on macOS, or from `~/.claude/.credentials.json` on Linux (`%USERPROFILE%\.claude\.credentials.json` on Windows).
 2. It makes a minimal API call to `api.anthropic.com/v1/messages` — one token of Haiku, basically free.
 3. The usage numbers come straight out of the response headers (`anthropic-ratelimit-unified-5h-utilization` and friends).
-4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic.
+4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic. With WiFi set up, it publishes the same JSON to the local MQTT broker instead.
 5. The firmware parses it and updates the LVGL dashboard.
 6. The firmware also tracks the rate of change of session % over a 5-minute window and picks splash animations from the matching mood group.
 7. The two side buttons are independent of all of this — they send Space and Shift+Tab as BLE HID keyboard input to the paired host directly.
@@ -220,6 +256,8 @@ The device advertises a custom GATT service alongside the standard HID keyboard 
 | **Data Service**           | `4c41555a-4465-7669-6365-000000000001` |
 | RX Characteristic (write)  | `4c41555a-4465-7669-6365-000000000002` |
 | TX Characteristic (notify) | `4c41555a-4465-7669-6365-000000000003` |
+| REQ Characteristic (notify) | `4c41555a-4465-7669-6365-000000000004` |
+| PROV Characteristic (write/notify) | `4c41555a-4465-7669-6365-000000000005` |
 | **HID Service**            | `00001812-0000-1000-8000-00805f9b34fb` |
 
 JSON payload format (written to RX):
@@ -229,6 +267,22 @@ JSON payload format (written to RX):
 ```
 
 Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+
+PROV carries WiFi setup from `clawdmeter-setup`: `{"op":"begin"}` shows a code
+and replies `{"id":"<device id>"}`. Then `{"op":"config","code":…,"ssid":…,"wpass":…,"broker_id":…,"pass":…}`
+replies `{"ok":true}`, and later `{"net":"up"}` once the device reaches the broker.
+
+### MQTT topics (WiFi transport)
+
+The broker announces itself over mDNS as `_clawdmeter._tcp` with TXT `id=<broker id>`.
+It listens on port 18830. The device id is the last 6 hex digits of its MAC
+address, and it is also the device's MQTT username.
+
+| Topic | Direction | Payload |
+| --- | --- | --- |
+| `clawdmeter/<id>/usage` | daemon → device (retained) | same JSON as RX |
+| `clawdmeter/<id>/refresh` | device → daemon | anything; asks for a poll now |
+| `clawdmeter/<id>/status` | device (retained, LWT) | `online` / `offline` |
 
 ## Development
 

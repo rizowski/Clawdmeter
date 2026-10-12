@@ -189,7 +189,7 @@ if [ ! -d "$VENV_DIR" ]; then
     "$PYTHON3" -m venv "$VENV_DIR"
 fi
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet "bleak>=0.22" "httpx>=0.27"
+"$VENV_DIR/bin/pip" install --quiet "bleak>=0.22" "httpx>=0.27" "paho-mqtt>=2.0" "zeroconf>=0.132"
 PYTHON_BIN="$VENV_DIR/bin/python"
 echo "  OK ($PYTHON_BIN)"
 echo ""
@@ -213,6 +213,24 @@ echo "[4/6] Configuring the daemon..."
 configure_config_dirs
 configure_clock
 configure_chime
+echo ""
+
+# Optional WiFi transport: a local password-protected MQTT broker the daemon
+# hosts. Devices are then set up with daemon/clawdmeter-setup.
+configure_wifi_transport() {
+    [ -t 0 ] || return 0
+    local ans
+    read -r -p "  Enable WiFi transport (MQTT; S3 boards only)? [y/N] " ans || ans=""
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "  WiFi transport skipped (Bluetooth only)."; return 0; }
+    if ! command -v mosquitto_passwd >/dev/null 2>&1; then
+        command -v brew >/dev/null 2>&1 || { echo "  Homebrew is needed to install mosquitto; skipping."; return 0; }
+        brew install mosquitto
+    fi
+    bash "$SCRIPT_DIR/daemon/broker/broker-init.sh"
+    WIFI_ENABLED=1
+}
+WIFI_ENABLED=0
+configure_wifi_transport
 echo ""
 
 echo "[5/6] Bluetooth permission check..."
@@ -264,6 +282,13 @@ echo "  2. Open System Settings → Bluetooth."
 echo "  3. Click 'Connect' next to 'Clawdmeter'."
 echo "  4. The daemon will discover it within ~30 s and start polling."
 echo ""
+if [ "$WIFI_ENABLED" = 1 ]; then
+    echo "WiFi setup (after Bluetooth pairing, with the daemon running):"
+    echo "  $SCRIPT_DIR/daemon/clawdmeter-setup"
+    echo "  Type the 6-digit code the device shows. If macOS asks whether"
+    echo "  mosquitto may accept incoming connections, click Allow."
+    echo ""
+fi
 echo "Useful commands:"
 echo "  launchctl list | grep claude-usage     # check it's running"
 echo "  tail -F $LOG_OUT                       # live logs"
