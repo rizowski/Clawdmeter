@@ -127,7 +127,8 @@ def interpret_begin_reply(reply: dict) -> tuple[str | None, str | None]:
     """(device_id, None) on success, else (None, message to show the user)."""
     err = reply.get("err")
     if err == "nowifi":
-        return None, "This board has no WiFi support — it keeps using Bluetooth."
+        return None, ("This device's firmware doesn't have WiFi turned on. Flash the latest\n"
+                      "firmware, then run clawdmeter-setup again. It keeps using Bluetooth meanwhile.")
     if err == "locked":
         return None, "Too many wrong codes. Wait a minute, then run clawdmeter-setup again."
     device_id = reply.get("id", "")

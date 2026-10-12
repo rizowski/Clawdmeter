@@ -77,7 +77,9 @@ def test_add_device_pipes_password_via_stdin_dedupes_devices_and_hups_broker(tmp
 def test_interpret_begin_reply():
     assert s.interpret_begin_reply({"id": "a1b2c3"}) == ("a1b2c3", None)
     dev, msg = s.interpret_begin_reply({"err": "nowifi"})
-    assert dev is None and "no WiFi" in msg
+    # Every supported chip has a WiFi radio; "nowifi" means the firmware build
+    # doesn't enable it, so the fix is a firmware update, not new hardware.
+    assert dev is None and "firmware" in msg and "no WiFi" not in msg
     dev, msg = s.interpret_begin_reply({"err": "locked"})
     assert dev is None and "wait a minute" in msg.lower()
     dev, msg = s.interpret_begin_reply({"id": "../etc"})
