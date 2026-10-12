@@ -72,5 +72,13 @@ check '[ "$all" = "{\"s\":1} {\"s\":2} " ]' "viewer reads every device's usage"
 mosquitto_pub "${P[@]}" "${V[@]}" -q 1 -r -t clawdmeter/abc123/usage -m '{"s":99}' 2>/dev/null
 got="$(mosquitto_sub "${P[@]}" -u abc123 -P devpass -t clawdmeter/abc123/usage -C 1 -W 3 2>/dev/null)"
 check '[ "$got" = "{\"s\":1}" ]' "viewer cannot publish usage"
+# The per-device %u patterns apply to every user, so without a deny rule the
+# viewer could publish clawdmeter/viewer/refresh and make the daemon poll.
+( sleep 1; mosquitto_pub "${P[@]}" "${V[@]}" -t clawdmeter/viewer/refresh -m x 2>/dev/null
+  mosquitto_pub "${P[@]}" "${V[@]}" -t clawdmeter/viewer/status -m x 2>/dev/null ) &
+PUBS=$!
+heard="$(mosquitto_sub "${P[@]}" -u daemon -P "$DAEMON_PASS" -t 'clawdmeter/+/refresh' -t 'clawdmeter/+/status' -v -C 1 -W 3 2>/dev/null)"
+wait "$PUBS"
+check '[ -z "$heard" ]' "viewer cannot trigger a refresh or fake a status"
 
 exit $fail

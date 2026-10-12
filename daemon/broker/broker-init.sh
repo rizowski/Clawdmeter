@@ -65,6 +65,10 @@ topic read clawdmeter/+/status
 
 user viewer
 topic read clawdmeter/#
+# The %u patterns above apply to every user. Without these the viewer could
+# publish clawdmeter/viewer/refresh and make the daemon poll the API.
+topic deny clawdmeter/viewer/refresh
+topic deny clawdmeter/viewer/status
 ACL
 
 cat > "$DIR/mosquitto.conf" <<CONF
