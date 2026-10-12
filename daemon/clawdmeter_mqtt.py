@@ -110,19 +110,37 @@ class BrokerSupervisor:
 
 
 def lan_ipv4_addresses() -> list[str]:
-    from zeroconf import get_all_addresses
-    return sorted(a for a in get_all_addresses() if not a.startswith(("127.", "169.254.")))
+    """The default-route IPv4 address, as a one-item list (empty when offline).
+
+    Only this one is announced: the device connects to the FIRST address in
+    the mDNS answer, and announcing every interface put VPN / Tailscale /
+    container addresses (e.g. 10.244.x) ahead of the LAN one. A UDP
+    connect() sends no packets; it only asks the kernel which source address
+    the default route would use.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 9))   # TEST-NET-1, never actually contacted
+            addr = sock.getsockname()[0]
+    except OSError:
+        return []
+    if addr.startswith(("127.", "169.254.", "0.")):
+        return []
+    return [addr]
 
 
 class Announcer:
     """Advertises the broker as _clawdmeter._tcp with TXT id=<broker_id>, and
     re-announces when this machine's LAN addresses change."""
 
-    def __init__(self, broker_id: str, port: int, log: Callable[[str], None] = print) -> None:
+    def __init__(self, broker_id: str, port: int, log: Callable[[str], None] = print,
+                 zc_factory: Callable | None = None, check_s: float = 15) -> None:
         self.broker_id = broker_id
         self.port = port
         self.log = log
         self.host = socket.gethostname().split(".")[0]
+        self.zc_factory = zc_factory
+        self.check_s = check_s
 
     def _info(self, addrs: list[str]):
         from zeroconf import ServiceInfo
@@ -135,32 +153,39 @@ class Announcer:
             parsed_addresses=addrs,
         )
 
-    async def run(self, stop_event: asyncio.Event) -> None:
+    def _new_zeroconf(self):
+        if self.zc_factory is not None:
+            return self.zc_factory()
         from zeroconf import IPVersion
         from zeroconf.asyncio import AsyncZeroconf
+        return AsyncZeroconf(ip_version=IPVersion.V4Only)
 
-        addrs = lan_ipv4_addresses()
-        while not addrs and not stop_event.is_set():
-            await _sleep_or_stop(stop_event, 10)
-            addrs = lan_ipv4_addresses()
-        if stop_event.is_set():
-            return
-        azc = AsyncZeroconf(ip_version=IPVersion.V4Only)
-        info = self._info(addrs)
-        await azc.async_register_service(info)
-        self.log(f"mDNS: announced broker on {', '.join(addrs)}:{self.port}")
+    async def run(self, stop_event: asyncio.Event) -> None:
+        addrs: list[str] = []
+        azc = None
         try:
             while not stop_event.is_set():
-                await _sleep_or_stop(stop_event, 60)
                 new = lan_ipv4_addresses()
-                if new and new != addrs:
+                if new != addrs:
+                    # A fresh instance per address set: zeroconf binds its
+                    # sockets per interface address at start, so after a WiFi
+                    # rejoin with a new IP the old one can stop answering.
+                    if azc is not None:
+                        await azc.async_unregister_all_services()
+                        await azc.async_close()
+                        azc = None
                     addrs = new
-                    info = self._info(addrs)
-                    await azc.async_update_service(info)
-                    self.log(f"mDNS: addresses changed -> {', '.join(addrs)}")
+                    if addrs:
+                        azc = self._new_zeroconf()
+                        await azc.async_register_service(self._info(addrs))
+                        self.log(f"mDNS: announced broker on {addrs[0]}:{self.port}")
+                    else:
+                        self.log("mDNS: no network; waiting")
+                await _sleep_or_stop(stop_event, self.check_s)
         finally:
-            await azc.async_unregister_all_services()
-            await azc.async_close()
+            if azc is not None:
+                await azc.async_unregister_all_services()
+                await azc.async_close()
 
 
 class Publisher:

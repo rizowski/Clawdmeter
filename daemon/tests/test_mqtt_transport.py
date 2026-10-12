@@ -166,3 +166,67 @@ def test_announcer_advertises_broker_id_over_mdns():
         assert port == 18935
 
     asyncio.run(scenario())
+
+
+def test_lan_addresses_is_only_the_default_route_address(monkeypatch):
+    # The device takes the FIRST IPv4 in the mDNS answer. Announcing every
+    # interface let a Tailscale/VPN address come first, so the device never
+    # reached the broker. Only the default-route address is announced.
+    class FakeSock:
+        def __init__(self, *_a):
+            pass
+
+        def connect(self, _addr):
+            pass
+
+        def getsockname(self):
+            return ("192.168.1.20", 5353)
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            self.close()
+
+    monkeypatch.setattr(m.socket, "socket", FakeSock)
+    assert m.lan_ipv4_addresses() == ["192.168.1.20"]
+
+
+def test_announcer_rebuilds_zeroconf_when_the_address_changes(monkeypatch):
+    # python-zeroconf binds sockets per address at start; after a WiFi rejoin
+    # with a new IP the old instance can go deaf, so build a fresh one.
+    addrs = iter([["10.0.0.5"], ["10.0.0.5"], ["10.0.0.9"]])
+    monkeypatch.setattr(m, "lan_ipv4_addresses", lambda: next(addrs, ["10.0.0.9"]))
+    made = []
+
+    class FakeZC:
+        def __init__(self):
+            self.registered = []
+            made.append(self)
+
+        async def async_register_service(self, info):
+            self.registered.append(info.parsed_addresses())
+
+        async def async_update_service(self, info):
+            self.registered.append(info.parsed_addresses())
+
+        async def async_unregister_all_services(self):
+            pass
+
+        async def async_close(self):
+            pass
+
+    async def scenario():
+        stop = asyncio.Event()
+        ann = m.Announcer("00aa11bb22cc33dd", 18830, log=lambda _s: None, zc_factory=FakeZC, check_s=0.01)
+        task = asyncio.create_task(ann.run(stop))
+        await asyncio.sleep(0.2)
+        stop.set()
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(scenario())
+    assert len(made) == 2
+    assert made[1].registered == [["10.0.0.9"]]
