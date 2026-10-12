@@ -146,7 +146,9 @@ class Announcer:
         from zeroconf import ServiceInfo
         return ServiceInfo(
             SERVICE_TYPE,
-            f"Clawdmeter broker on {self.host}.{SERVICE_TYPE}",
+            # The id keeps two brokers on one host (two users, or a test next to
+            # the live daemon) from fighting over one name. Devices match on id.
+            f"Clawdmeter broker {self.broker_id[:6]} on {self.host}.{SERVICE_TYPE}",
             port=self.port,
             properties={"id": self.broker_id},
             server=f"clawdmeter-broker-{self.host}.local.",

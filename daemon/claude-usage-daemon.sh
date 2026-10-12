@@ -317,7 +317,7 @@ broker_ensure() {
 announce_ensure() {
     if [ -n "$AVAHI_PID" ] && kill -0 "$AVAHI_PID" 2>/dev/null; then return 0; fi
     command -v avahi-publish-service >/dev/null || { log "avahi-publish-service missing; devices can't find the broker"; return 1; }
-    avahi-publish-service "Clawdmeter broker on $(hostname -s)" _clawdmeter._tcp "$BROKER_PORT" "id=$BROKER_ID" >/dev/null 2>&1 &
+    avahi-publish-service "Clawdmeter broker ${BROKER_ID:0:6} on $(hostname -s)" _clawdmeter._tcp "$BROKER_PORT" "id=$BROKER_ID" >/dev/null 2>&1 &
     AVAHI_PID=$!
     log "mDNS: announcing _clawdmeter._tcp on port $BROKER_PORT"
 }
@@ -346,7 +346,7 @@ mqtt_publish() {
     return $rc
 }
 
-# Best-effort BLE copy in MQTT mode, for devices not on WiFi (a C6, one just
+# Best-effort BLE copy in MQTT mode, for devices not on WiFi (one not set up yet, one just
 # factory-reset, a failed network change). Only writes to a device the system
 # already has connected: no scanning, no connect attempts, no retries.
 ble_opportunistic_send() {
