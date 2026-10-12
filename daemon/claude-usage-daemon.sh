@@ -12,6 +12,9 @@ RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID="4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL=60
 TICK=5
+# Floor between refresh-triggered polls (MQTT mode): anything holding a device
+# login can publish refresh at will; without this each is an API call.
+REFRESH_MIN_GAP=15
 SAVED_MAC_FILE="$HOME/.config/claude-usage-monitor/ble-address"
 CONFIG_FILE="$HOME/.config/claude-usage-monitor/config"
 REFRESH_FLAG="/tmp/claude-usage-refresh-$$"
@@ -375,7 +378,8 @@ send_payload() {
 # retained message keeps the device's last numbers meanwhile.
 mqtt_tick() {
     local now="$1"
-    if [ -f "$REFRESH_FLAG" ] || (( now - LAST_POLL >= POLL_INTERVAL )); then
+    local since=$(( now - LAST_POLL ))
+    if (( since >= POLL_INTERVAL )) || { [ -f "$REFRESH_FLAG" ] && (( since >= REFRESH_MIN_GAP )); }; then
         if [ -f "$REFRESH_FLAG" ]; then
             log "Refresh requested by device"
             rm -f "$REFRESH_FLAG"

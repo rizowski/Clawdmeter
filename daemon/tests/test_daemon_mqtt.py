@@ -4,6 +4,7 @@
 Run: daemon/.venv/bin/python -m pytest daemon/tests/test_daemon_mqtt.py -x -q
 """
 import asyncio
+import time
 
 import daemon.claude_usage_daemon as mod
 
@@ -63,6 +64,7 @@ def _run_until(stop_after_publishes, payloads, monkeypatch, devices=("a1b2c3",))
 
     monkeypatch.setattr(mod, "poll_active", fake_poll_active)
     monkeypatch.setattr(mod, "TICK", 0.05)
+    monkeypatch.setattr(mod, "REFRESH_MIN_GAP", 0)
 
     async def scenario():
         stop = asyncio.Event()
@@ -125,6 +127,46 @@ def test_run_mqtt_polls_at_most_once_per_interval_while_broker_is_down(monkeypat
     finally:
         FakePublisher.connected = True
     assert polls == [1]
+
+
+def _spam_refresh(monkeypatch, gap, run_s):
+    """Fire a refresh every 10 ms for run_s seconds; return how many polls ran."""
+    FakePublisher.instances.clear()
+    polls = []
+
+    async def counting_poll(*_a):
+        polls.append(1)
+        return ({"s": 1, "ok": True}, False)
+
+    monkeypatch.setattr(mod.mqtt_transport, "Publisher", FakePublisher)
+    monkeypatch.setattr(mod.mqtt_transport, "read_devices", lambda *_a: ["a1b2c3"])
+    monkeypatch.setattr(mod, "poll_active", counting_poll)
+    monkeypatch.setattr(mod, "TICK", 0.02)
+    monkeypatch.setattr(mod, "REFRESH_MIN_GAP", gap)
+
+    async def scenario():
+        stop = asyncio.Event()
+        task = asyncio.create_task(mod.run_mqtt({"BROKER_PORT": "1", "DAEMON_PASS": "x"}, stop, ble=RecordingBle()))
+        end = time.monotonic() + run_s
+        while time.monotonic() < end:
+            await asyncio.sleep(0.01)
+            if FakePublisher.instances:
+                FakePublisher.instances[0].on_refresh("a1b2c3")
+        stop.set()
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(scenario())
+    return len(polls)
+
+
+def test_run_mqtt_refresh_flood_costs_one_poll_per_gap(monkeypatch):
+    # Anyone holding a device login can publish refresh as fast as they like;
+    # each one must not become an Anthropic API call.
+    assert _spam_refresh(monkeypatch, gap=10, run_s=0.4) == 1
+
+
+def test_run_mqtt_serves_a_held_back_refresh_once_the_gap_passes(monkeypatch):
+    assert 2 <= _spam_refresh(monkeypatch, gap=0.25, run_s=0.6) <= 3
 
 
 # ------------------------------------------------- BLE fallback in MQTT mode

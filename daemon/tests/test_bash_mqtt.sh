@@ -28,6 +28,7 @@ check '[ "$(read_transport_setting)" = ble ]' "unknown transport falls back to b
 # per POLL_INTERVAL instead of one every TICK.
 eval "$(extract mqtt_tick)"
 POLL_INTERVAL=60
+REFRESH_MIN_GAP=15
 REFRESH_FLAG="$TMP/refresh"
 BROKER_DIR="$TMP/stub"; mkdir -p "$BROKER_DIR"; echo a1b2c3 > "$BROKER_DIR/devices"
 poll() { POLLS=$((POLLS + 1)); return 1; }
@@ -36,6 +37,12 @@ mqtt_tick 1000; mqtt_tick 1005; mqtt_tick 1010
 check '[ "$POLLS" -eq 1 ] && [ "$LAST_POLL" -eq 1000 ]' "failed send doesn't re-poll every tick"
 touch "$REFRESH_FLAG"; mqtt_tick 1015
 check '[ "$POLLS" -eq 2 ] && [ ! -f "$REFRESH_FLAG" ]' "refresh request polls right away"
+# Anyone with a device login can flood refresh; each must not be an API call.
+POLLS=0; LAST_POLL=2000
+touch "$REFRESH_FLAG"; mqtt_tick 2005; mqtt_tick 2010
+check '[ "$POLLS" -eq 0 ] && [ -f "$REFRESH_FLAG" ]' "refresh inside the gap is held, not polled"
+mqtt_tick 2015
+check '[ "$POLLS" -eq 1 ] && [ ! -f "$REFRESH_FLAG" ]' "held refresh is served once the gap passes"
 
 # MQTT mode still offers each payload over BLE, for devices not on WiFi.
 eval "$(extract send_payload)"

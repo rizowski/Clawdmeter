@@ -39,6 +39,9 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 TICK = 5
+# Floor between refresh-triggered polls. Anything holding a device's MQTT login
+# can publish refresh at will; without this each one is an Anthropic API call.
+REFRESH_MIN_GAP = 15
 CONNECT_TIMEOUT = 20.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -900,7 +903,8 @@ async def run_mqtt(env: dict, stop_event: asyncio.Event, ble: "OpportunisticBle 
     last_poll = 0.0
     try:
         while not stop_event.is_set():
-            if refresh.is_set() or time.time() - last_poll >= POLL_INTERVAL:
+            since = time.time() - last_poll
+            if since >= POLL_INTERVAL or (refresh.is_set() and since >= REFRESH_MIN_GAP):
                 refresh.clear()
                 # Same free-ride token policy as the BLE path (see connect_and_run).
                 payload, dead = await poll_active()
@@ -921,6 +925,13 @@ async def run_mqtt(env: dict, stop_event: asyncio.Event, ble: "OpportunisticBle 
                     elif devices:
                         log("Broker not connected; MQTT copy skipped this cycle")
                     await ble.send(payload)
+            if refresh.is_set():
+                # Held back by REFRESH_MIN_GAP: sleep, don't spin on the set event.
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=TICK)
+                except asyncio.TimeoutError:
+                    pass
+                continue
             try:
                 await asyncio.wait_for(refresh.wait(), timeout=TICK)
             except asyncio.TimeoutError:
