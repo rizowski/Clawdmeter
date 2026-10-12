@@ -4,6 +4,9 @@
 Polls Claude API rate-limit headers and writes a JSON payload to the
 ESP32 "Clawdmeter" peripheral over a custom GATT service. Uses
 bleak (CoreBluetooth backend on macOS).
+
+With `transport = mqtt` in the config (set by clawdmeter-setup), usage is
+published to the local MQTT broker instead (see clawdmeter_mqtt.py).
 """
 
 import asyncio
@@ -23,6 +26,11 @@ from pathlib import Path
 import httpx
 from bleak import BleakClient
 from bleak.exc import BleakError
+
+try:  # run as a script (sys.path[0] == daemon/) or imported as daemon.* by tests
+    import clawdmeter_mqtt as mqtt_transport
+except ImportError:
+    from daemon import clawdmeter_mqtt as mqtt_transport
 
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
@@ -357,6 +365,29 @@ def read_clock_setting() -> str:
     except OSError:
         pass
     return "off"
+
+
+def read_transport_setting() -> str:
+    """Read the `transport` option from the config file. One of: ble|mqtt.
+
+    Defaults to "ble". clawdmeter-setup flips it to "mqtt" once a device has
+    reached the broker over WiFi. Read once at startup — the setup CLI
+    restarts the daemon after changing it.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "transport":
+                    val = val.strip().lower()
+                    if val in ("ble", "mqtt"):
+                        return val
+    except OSError:
+        pass
+    return "ble"
 
 
 def add_chime_field(payload: dict) -> None:
@@ -800,23 +831,52 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     return used_successfully
 
 
-async def main() -> None:
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
+async def run_mqtt(env: dict, stop_event: asyncio.Event) -> None:
+    """Poll Anthropic and publish to every set-up device over the local broker.
 
-    def _stop(*_args: object) -> None:
-        log("Daemon stopping")
-        stop_event.set()
+    The broker keeps the last payload retained, so a device that walks back
+    into range gets current numbers the moment it reconnects; its refresh
+    request then triggers a fresh poll right away.
+    """
+    refresh = asyncio.Event()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _stop)
-        except NotImplementedError:
-            signal.signal(sig, _stop)
+    def _on_refresh(device_id: str) -> None:
+        log(f"Refresh requested by {device_id}")
+        refresh.set()
 
-    log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
-    log(f"Poll interval: {POLL_INTERVAL}s")
+    pub = mqtt_transport.Publisher(env, asyncio.get_running_loop(), _on_refresh, log)
+    pub.start()
+    last_poll = 0.0
+    try:
+        while not stop_event.is_set():
+            if refresh.is_set() or time.time() - last_poll >= POLL_INTERVAL:
+                refresh.clear()
+                devices = mqtt_transport.read_devices()
+                if not devices:
+                    log("No WiFi devices set up yet; run daemon/clawdmeter-setup")
+                    last_poll = time.time()
+                else:
+                    # Same free-ride token policy as the BLE path (see connect_and_run).
+                    payload, dead = await poll_active()
+                    if payload is not None:
+                        log(f"Publishing: {json.dumps(payload, separators=(',', ':'))}")
+                        if pub.publish_usage(devices, payload):
+                            last_poll = time.time()
+                    elif dead:
+                        log("No usable token; signalling no-data to devices")
+                        if pub.publish_usage(devices, {"ok": False}):
+                            last_poll = time.time()
+                    else:
+                        log("No usable config dir this cycle")
+            try:
+                await asyncio.wait_for(refresh.wait(), timeout=TICK)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        pub.stop()
 
+
+async def run_ble(stop_event: asyncio.Event) -> None:
     backoff = 1
     skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle
     while not stop_event.is_set():
@@ -850,6 +910,46 @@ async def main() -> None:
             backoff = min(backoff * 2, 60)
         else:
             backoff = 1
+
+
+
+async def main() -> None:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _stop(*_args: object) -> None:
+        log("Daemon stopping")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:
+            signal.signal(sig, _stop)
+
+    log("=== Claude Usage Tracker Daemon (macOS) ===")
+    log(f"Poll interval: {POLL_INTERVAL}s")
+
+    # The broker + mDNS announcement run whenever broker-init.sh has been run,
+    # even in BLE mode — clawdmeter-setup needs the broker up to verify a
+    # freshly provisioned device before switching the transport to MQTT.
+    env = mqtt_transport.read_broker_env()
+    side_tasks = []
+    if env is not None:
+        side_tasks.append(asyncio.create_task(mqtt_transport.BrokerSupervisor(log=log).run(stop_event)))
+        side_tasks.append(asyncio.create_task(
+            mqtt_transport.Announcer(env["BROKER_ID"], int(env["BROKER_PORT"]), log).run(stop_event)))
+    try:
+        if env is not None and read_transport_setting() == "mqtt":
+            log("Transport: MQTT (WiFi)")
+            await run_mqtt(env, stop_event)
+        else:
+            if read_transport_setting() == "mqtt":
+                log("transport = mqtt but no broker is set up; falling back to BLE")
+            await run_ble(stop_event)
+    finally:
+        stop_event.set()
+        await asyncio.gather(*side_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
