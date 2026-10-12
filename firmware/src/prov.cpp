@@ -9,7 +9,6 @@ static NetConfig   cfg = {};
 static bool        configured = false;
 static ProvSession sess = {};
 static char        dev_id[7];
-static bool        net_up_pending = false;
 
 static void load(void) {
     Preferences p;
@@ -36,7 +35,6 @@ static void adopt(const NetConfig& next) {
     cfg = next;
     configured = true;
     save();
-    net_up_pending = true;
     Serial.printf("PROV: saved config (ssid=%s broker=%s)\n", cfg.ssid, cfg.broker_id);
 }
 
@@ -113,16 +111,9 @@ void prov_clear(void) {
     cfg = {};
     configured = false;
     sess.active = false;
-    net_up_pending = false;
     Preferences p;
     p.begin("clawdnet", false);
     p.clear();
     p.end();
     Serial.println("PROV: WiFi config cleared");
-}
-
-bool prov_take_net_up_pending(void) {
-    bool v = net_up_pending;
-    net_up_pending = false;
-    return v;
 }

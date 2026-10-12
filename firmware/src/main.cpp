@@ -438,14 +438,16 @@ void loop() {
         ui_update_battery(pct, charging);
     }
 
+    static NetUpGate net_up = {};
     if (ble_has_prov()) {
         char resp[64];
         bool applied = prov_handle_write(ble_get_prov(), resp, sizeof resp);
         ble_prov_notify(resp);
-        if (applied) net_apply_config();
+        if (applied) net_up_arm(&net_up, net_apply_config());
     }
-    // Tell clawdmeter-setup the whole path works once the broker answers.
-    if (net_get_state() == NET_CONNECTED && prov_take_net_up_pending()) {
+    // Tell clawdmeter-setup the whole path works once the broker answers —
+    // for the config it just pushed, not a session left over from the old one.
+    if (net_up_take(&net_up, net_connected_generation())) {
         ble_prov_notify("{\"net\":\"up\"}");
     }
 

@@ -76,6 +76,17 @@ prov_result_t prov_session_apply(ProvSession* s, const char* json, uint32_t now_
     return PROV_OK;
 }
 
+void net_up_arm(NetUpGate* g, uint32_t config_gen) {
+    g->want = config_gen;
+    g->armed = true;
+}
+
+bool net_up_take(NetUpGate* g, uint32_t connected_gen) {
+    if (!g->armed || connected_gen == 0 || connected_gen != g->want) return false;
+    g->armed = false;
+    return true;
+}
+
 void netcfg_device_id(const uint8_t base_mac[6], char out[7]) {
     snprintf(out, 7, "%02x%02x%02x", base_mac[3], base_mac[4], base_mac[5]);
 }

@@ -154,6 +154,17 @@ static void should_reset_wrong_code_count_after_success() {
     CHECK(s.fails == 0);
 }
 
+static void should_report_net_up_only_for_the_config_just_applied() {
+    // Re-provisioning while connected must not report the OLD session as
+    // success for the NEW config (a wrong new password would look fine).
+    NetUpGate g = {};
+    net_up_arm(&g, 2);
+    CHECK(!net_up_take(&g, 0));   // not connected
+    CHECK(!net_up_take(&g, 1));   // still the previous config's session
+    CHECK(net_up_take(&g, 2));    // the new config reached the broker
+    CHECK(!net_up_take(&g, 2));   // reported once
+}
+
 int main() {
     should_parse_config_with_json_hostile_chars();
     should_accept_max_length_ssid_and_pass_and_reject_longer();
@@ -170,6 +181,7 @@ int main() {
     should_not_reset_wrong_code_count_on_a_new_begin();
     should_refuse_begin_during_lockout_then_allow_after();
     should_reset_wrong_code_count_after_success();
+    should_report_net_up_only_for_the_config_just_applied();
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all netcfg tests passed\n");
     return 0;

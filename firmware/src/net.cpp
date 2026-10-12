@@ -12,8 +12,9 @@
 #ifndef BOARD_HAS_WIFI
 
 void net_init(void) {}
-void net_apply_config(void) {}
+uint32_t net_apply_config(void) { return 0; }
 net_state_t net_get_state(void) { return NET_OFF; }
+uint32_t net_connected_generation(void) { return 0; }
 bool net_has_data(void) { return false; }
 const char* net_get_data(void) { return ""; }
 
@@ -40,6 +41,9 @@ static volatile bool auth_failed = false;
 static volatile bool reconfig = false;
 static volatile net_state_t state = NET_OFF;
 static volatile uint32_t mqtt_down_since = 0;
+static uint32_t          pending_gen = 0;      // bumped by every net_apply_config (loop task)
+static volatile uint32_t applied_gen = 0;      // generation the net task is running
+static volatile uint32_t connected_gen = 0;    // generation of the live MQTT session
 
 static NetConfig pending = {};   // written by the loop task under mux
 static NetConfig active  = {};   // net task's private copy
@@ -53,6 +57,7 @@ static void mqtt_event(void*, esp_event_base_t, int32_t id, void* data) {
     case MQTT_EVENT_CONNECTED:
         mqtt_up = true;
         auth_failed = false;
+        connected_gen = applied_gen;
         esp_mqtt_client_subscribe_single(ev->client, t_usage, 1);   // the non-_single name is a C-only _Generic macro
         esp_mqtt_client_publish(ev->client, t_status, "online", 0, 1, 1);
         esp_mqtt_client_publish(ev->client, t_refresh, "1", 0, 1, 0);  // ask the daemon to poll now
@@ -61,6 +66,7 @@ static void mqtt_event(void*, esp_event_base_t, int32_t id, void* data) {
     case MQTT_EVENT_DISCONNECTED:
         if (mqtt_up) mqtt_down_since = millis();
         mqtt_up = false;
+        connected_gen = 0;
         break;
     case MQTT_EVENT_DATA:
         // Usage payloads are < 512 B, so they always arrive in one piece.
@@ -97,6 +103,7 @@ static void mqtt_stop(void) {
     esp_mqtt_client_destroy(client);
     client = nullptr;
     mqtt_up = false;
+    connected_gen = 0;
 }
 
 // Browse _clawdmeter._tcp for the broker this device was paired with.
@@ -136,6 +143,7 @@ static void mqtt_start(IPAddress ip, uint16_t port) {
 static void apply_pending(void) {
     portENTER_CRITICAL(&mux);
     active = pending;
+    applied_gen = pending_gen;
     reconfig = false;
     portEXIT_CRITICAL(&mux);
     mqtt_stop();
@@ -198,19 +206,25 @@ void net_init(void) {
     net_apply_config();
 }
 
-void net_apply_config(void) {
+uint32_t net_apply_config(void) {
     portENTER_CRITICAL(&mux);
     pending = *prov_config();
+    uint32_t gen = ++pending_gen;
     reconfig = true;
     portEXIT_CRITICAL(&mux);
     // The task (and the WiFi stack's RAM) only comes up once a config exists.
     if (!net_task_h && netcfg_is_valid(prov_config())) {
         xTaskCreatePinnedToCore(net_task, "net", 8192, nullptr, 1, &net_task_h, 0);
     }
+    return gen;
 }
 
 net_state_t net_get_state(void) {
     return state;
+}
+
+uint32_t net_connected_generation(void) {
+    return connected_gen;
 }
 
 bool net_has_data(void) {

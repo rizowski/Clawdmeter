@@ -40,6 +40,18 @@ bool prov_session_visible(const ProvSession* s, uint32_t now_ms);
 // config into *out and ends the session. Bad JSON doesn't count as a wrong code.
 prov_result_t prov_session_apply(ProvSession* s, const char* json, uint32_t now_ms, NetConfig* out);
 
+// "net up" for clawdmeter-setup, gated on config generation: each applied
+// config gets a new generation, and only an MQTT session started from that
+// generation counts. Without this a re-provision while connected reported the
+// old session as success for the new (possibly wrong) WiFi password.
+struct NetUpGate {
+    uint32_t want;
+    bool     armed;
+};
+void net_up_arm(NetUpGate* g, uint32_t config_gen);
+// connected_gen: generation of the live MQTT session, 0 when not connected.
+bool net_up_take(NetUpGate* g, uint32_t connected_gen);
+
 // Device id = last 3 bytes of the 6-byte base MAC, lowercase hex. Callers pass
 // the 6-byte WiFi-STA MAC (esp_read_mac(..., ESP_MAC_WIFI_STA)), not the C6's
 // 8-byte EUI-64, which has an ff:fe filler in the middle.

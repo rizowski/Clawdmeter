@@ -17,4 +17,3 @@ bool prov_apply_unchecked(const char*) { return false; }
 bool prov_code_visible(void) { return false; }
 const char* prov_code(void) { return ""; }
 void prov_clear(void) {}
-bool prov_take_net_up_pending(void) { return false; }

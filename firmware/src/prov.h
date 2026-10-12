@@ -21,4 +21,3 @@ bool prov_apply_unchecked(const char* json);
 bool prov_code_visible(void);
 const char* prov_code(void);
 void prov_clear(void);                      // part of the hold-to-pair reset
-bool prov_take_net_up_pending(void);        // true once after a config is applied
