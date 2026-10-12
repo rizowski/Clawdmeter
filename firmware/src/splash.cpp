@@ -277,6 +277,7 @@ static uint8_t         prev_cells[GRID * GRID];
 static const uint16_t* prev_palette = NULL;
 static bool            prev_valid   = false;
 static bool            force_full   = false;  // repaint everything on the next render
+static bool            covered      = false;  // an LVGL overlay is on top: don't draw
 
 // Upscale grid cells [gx0..gx1]×[gy0..gy1] and push them to the panel, one
 // grid-row band at a time so the scratch buffer stays (GRID*scr_cell × scr_cell).
@@ -302,6 +303,7 @@ static void blit_cells(const uint8_t* cells, const uint16_t* palette,
 static void render_frame(const uint8_t *cells, const uint16_t *palette) {
     if (!strip_buf) return;
     if (!active) return;          // never draw to the panel while not shown
+    if (covered) return;          // would paint over the overlay
     bool full = force_full || !prev_valid || palette != prev_palette;
     force_full = false;
 
@@ -870,6 +872,15 @@ void splash_show(void) {
     // drawn now. Defer the full repaint to the next splash_tick(), which runs
     // after lv_timer_handler() in the main loop.
     force_full = true;
+#endif
+}
+
+void splash_set_covered(bool c) {
+#if SPLASH_DIRECT_DRAW
+    if (covered && !c) force_full = true;   // LVGL redraws black first; repaint after
+    covered = c;
+#else
+    (void)c;                                 // canvas path: LVGL layers it correctly
 #endif
 }
 

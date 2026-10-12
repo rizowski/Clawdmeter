@@ -658,6 +658,7 @@ static void build_code_overlay(void) {
 
 void ui_show_setup_code(const char* code) {
     if (!code_overlay) return;
+    splash_set_covered(code != nullptr);
     if (!code) {
         lv_obj_add_flag(code_overlay, LV_OBJ_FLAG_HIDDEN);
         return;

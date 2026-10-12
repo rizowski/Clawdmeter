@@ -24,6 +24,11 @@ void splash_pick_for_current_rate(void);
 // True when splash is currently rendering (used to gate re-picks).
 bool splash_is_active(void);
 
+// Something on lv_layer_top (the setup-code overlay) covers the splash. The
+// direct-draw path (no PSRAM) writes to the panel behind LVGL's back, so it
+// must stop while covered and repaint in full once uncovered.
+void splash_set_covered(bool covered);
+
 // Root container (so ui.cpp can attach a click event).
 lv_obj_t* splash_get_root(void);
 
