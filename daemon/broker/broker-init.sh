@@ -36,11 +36,18 @@ if [ "$BROKER_PORT" != "$PORT" ] && [ -n "${CLAWD_BROKER_PORT:-}" ]; then
     sed -i.bak "s/^BROKER_PORT=.*/BROKER_PORT=$PORT/" "$DIR/broker.env" && rm -f "$DIR/broker.env.bak"
     BROKER_PORT="$PORT"
 fi
+# Read-only account for MQTT viewers (MQTT Analyzer, MQTT Explorer). Added on
+# re-run for brokers set up before it existed.
+if [ -z "${VIEWER_PASS:-}" ]; then
+    VIEWER_PASS="$(rand_hex 12)"
+    printf 'VIEWER_PASS=%s\n' "$VIEWER_PASS" >> "$DIR/broker.env"
+fi
 
 # Passwords go in through stdin / a 0600 options file, never argv: a command
 # line is visible to every local user via ps.
 [ -f "$DIR/passwd" ] || : > "$DIR/passwd"
 printf '%s\n%s\n' "$DAEMON_PASS" "$DAEMON_PASS" | "$MPASS" "$DIR/passwd" daemon >/dev/null
+printf '%s\n%s\n' "$VIEWER_PASS" "$VIEWER_PASS" | "$MPASS" "$DIR/passwd" viewer >/dev/null
 printf -- '-h 127.0.0.1\n-p %s\n-u daemon\n-P %s\n' "$BROKER_PORT" "$DAEMON_PASS" > "$DIR/client.conf"
 [ -f "$DIR/devices" ] || : > "$DIR/devices"
 
@@ -55,6 +62,9 @@ user daemon
 topic write clawdmeter/+/usage
 topic read clawdmeter/+/refresh
 topic read clawdmeter/+/status
+
+user viewer
+topic read clawdmeter/#
 ACL
 
 cat > "$DIR/mosquitto.conf" <<CONF
@@ -73,3 +83,4 @@ CONF
 
 chmod 600 "$DIR"/broker.env "$DIR"/client.conf "$DIR"/passwd "$DIR"/acl "$DIR"/mosquitto.conf "$DIR"/devices
 echo "Broker ready: $DIR (id=$BROKER_ID, port=$BROKER_PORT)"
+echo "Read-only MQTT login for viewer apps: user 'viewer', password VIEWER_PASS in $DIR/broker.env"

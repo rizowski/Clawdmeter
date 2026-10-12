@@ -34,6 +34,15 @@ first_id="$BROKER_ID"; first_pass="$DAEMON_PASS"
 bash "$INIT" "$B" >/dev/null
 . "$B/broker.env"
 check '[ "$BROKER_ID" = "$first_id" ] && [ "$DAEMON_PASS" = "$first_pass" ]' "re-run keeps id and password"
+check '[ ${#VIEWER_PASS} -eq 24 ]' "viewer password is 24 chars"
+first_viewer="$VIEWER_PASS"
+bash "$INIT" "$B" >/dev/null; . "$B/broker.env"
+check '[ "$VIEWER_PASS" = "$first_viewer" ]' "re-run keeps the viewer password"
+# A broker set up before the viewer account existed gets one on re-run.
+O="$TMP/old"; mkdir -p "$O"; chmod 700 "$O"
+printf 'BROKER_ID=0011223344556677\nBROKER_PORT=18931\nDAEMON_PASS=aaaaaaaaaaaaaaaaaaaaaaaa\n' > "$O/broker.env"
+bash "$INIT" "$O" >/dev/null
+check 'grep -Eq "^VIEWER_PASS=[0-9a-f]{24}$" "$O/broker.env" && grep -q "^DAEMON_PASS=aaaa" "$O/broker.env"' "re-run adds a viewer to an older broker"
 
 MOSQ="$(clawd_find_tool mosquitto)" || { echo "SKIP: live broker checks (mosquitto not installed)"; exit $fail; }
 MPASS="$(clawd_find_tool mosquitto_passwd)"
@@ -56,5 +65,12 @@ got="$(mosquitto_sub "${P[@]}" -u abc123 -P devpass -t clawdmeter/abc123/usage -
 check '[ "$got" = "{\"s\":1}" ]' "device reads its own retained usage"
 other="$(mosquitto_sub "${P[@]}" -u abc123 -P devpass -t clawdmeter/ffffff/usage -C 1 -W 2 2>/dev/null)"
 check '[ -z "$other" ]' "device cannot read another device's usage"
+# viewer: read-only access to every device, for tools like MQTT Analyzer.
+V=(-u viewer -P "$VIEWER_PASS")
+all="$(mosquitto_sub "${P[@]}" "${V[@]}" -t 'clawdmeter/+/usage' -C 2 -W 3 2>/dev/null | sort | tr '\n' ' ')"
+check '[ "$all" = "{\"s\":1} {\"s\":2} " ]' "viewer reads every device's usage"
+mosquitto_pub "${P[@]}" "${V[@]}" -q 1 -r -t clawdmeter/abc123/usage -m '{"s":99}' 2>/dev/null
+got="$(mosquitto_sub "${P[@]}" -u abc123 -P devpass -t clawdmeter/abc123/usage -C 1 -W 3 2>/dev/null)"
+check '[ "$got" = "{\"s\":1}" ]' "viewer cannot publish usage"
 
 exit $fail

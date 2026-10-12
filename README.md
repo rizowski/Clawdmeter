@@ -286,6 +286,11 @@ address, and it is also the device's MQTT username.
 | `clawdmeter/<id>/refresh` | device → daemon | anything; asks for a poll now |
 | `clawdmeter/<id>/status` | device (retained, LWT) | `online` / `offline` |
 
+To watch the traffic in a viewer app (MQTT Analyzer, MQTT Explorer), connect to
+this machine on port 18830 as user `viewer`. The password is `VIEWER_PASS` in
+`~/.config/claude-usage-monitor/broker/broker.env`. The `viewer` account can read
+every `clawdmeter/#` topic and publish nothing.
+
 ## Development
 
 <img src="assets/readme/crab.gif" width="120" align="right" alt="">
