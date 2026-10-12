@@ -163,6 +163,11 @@ static void should_report_net_up_only_for_the_config_just_applied() {
     CHECK(!net_up_take(&g, 1));   // still the previous config's session
     CHECK(net_up_take(&g, 2));    // the new config reached the broker
     CHECK(!net_up_take(&g, 2));   // reported once
+    // Re-provision while that session is still up: in the same loop pass the
+    // live session is still generation 2, which must not count for config 3.
+    net_up_arm(&g, 3);
+    CHECK(!net_up_take(&g, 2));
+    CHECK(net_up_take(&g, 3));
 }
 
 static void should_fire_an_armed_timer_past_the_int32_millis_boundary() {
