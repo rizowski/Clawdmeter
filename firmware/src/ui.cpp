@@ -292,6 +292,8 @@ static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 // connected but no usage update landed within DATA_FRESH_MS, the pairing hint
 // when BLE is down. Re-evaluated every loop in ui_tick_anim().
 static lv_obj_t* idle_group;            // the "Zzz" idle screen
+static lv_obj_t* code_overlay = nullptr; // setup code for clawdmeter-setup (top layer)
+static lv_obj_t* code_label = nullptr;
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
 static bool      data_ok = true;        // last payload's ok flag; a {"ok":false} beat = "no fresh data"
@@ -301,7 +303,8 @@ static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within t
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
-static bool     s_ble_connected = false;   // cached BLE connection state
+static bool     s_ble_connected = false;   // BLE or MQTT link up
+static net_state_t s_net = NET_OFF;        // WiFi transport state, for the status line
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
 // Animation state
@@ -610,7 +613,59 @@ static void build_pair_group(lv_obj_t* parent) {
     lv_obj_set_style_text_color(l3, COL_DIM, 0);
     lv_obj_align(l3, LV_ALIGN_TOP_MID, 0, L.pair_y3);
 
-    lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);  // ui_update_ble_status decides
+    lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);  // ui_update_link_status decides
+}
+
+// Setup-code overlay — full-screen on the top layer so it covers the splash
+// and the usage view alike while clawdmeter-setup waits for the code.
+static void build_code_overlay(void) {
+    code_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(code_overlay, L.scr_w, L.scr_h);
+    lv_obj_set_pos(code_overlay, 0, 0);
+    lv_obj_set_style_bg_color(code_overlay, COL_BG, 0);
+    lv_obj_set_style_bg_opa(code_overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(code_overlay, 0, 0);
+    lv_obj_set_style_radius(code_overlay, 0, 0);
+    lv_obj_set_style_pad_all(code_overlay, 0, 0);
+    lv_obj_clear_flag(code_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    code_label = lv_label_create(code_overlay);
+    lv_label_set_text(code_label, "");
+    lv_obj_set_style_text_font(code_label, L.pct_font, 0);
+    lv_obj_set_style_text_color(code_label, COL_TEXT, 0);
+    lv_obj_align(code_label, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t* hint = lv_label_create(code_overlay);
+    lv_label_set_text(hint, "Type it into\nclawdmeter-setup");   // never wrap mid-name
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, L.scr_w - 40);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(hint, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(hint, COL_DIM, 0);
+
+    // Title and hint hang off the code so the three read as one centred group,
+    // with the digits as the dominant element.
+    lv_obj_t* title = lv_label_create(code_overlay);
+    lv_label_set_text(title, "Setup code");
+    lv_obj_set_style_text_font(title, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(title, COL_DIM, 0);
+    lv_obj_update_layout(code_overlay);
+    lv_obj_align_to(title, code_label, LV_ALIGN_OUT_TOP_MID, 0, -L.margin / 2);
+    lv_obj_align_to(hint, code_label, LV_ALIGN_OUT_BOTTOM_MID, 0, L.margin);
+
+    lv_obj_add_flag(code_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+void ui_show_setup_code(const char* code) {
+    if (!code_overlay) return;
+    if (!code) {
+        lv_obj_add_flag(code_overlay, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    char spaced[8];
+    snprintf(spaced, sizeof spaced, "%.3s %.3s", code, code + 3);   // "123 456" reads easier
+    lv_label_set_text(code_label, spaced);
+    lv_obj_clear_flag(code_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 // Idle "Zzz" screen — shown when the host is connected but no usage update has
@@ -765,6 +820,8 @@ void ui_init(void) {
         lv_obj_del(battery_img);
         battery_img = nullptr;
     }
+
+    build_code_overlay();
 }
 
 // Per-character gradient via LVGL recolor markup, matching rainbow() in the
@@ -958,15 +1015,15 @@ void ui_update(const UsageData* data) {
     apply_colors();
 }
 
-// Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
+// Pick the usage-view sub-screen: pairing hint (no BLE link and no WiFi config), the idle "Zzz" screen
 // (connected but data has gone stale), or the live usage panels. Only re-lays-out
 // on an actual change. The animated status line stays visible everywhere — it
 // reads "Listening…" on the idle screen, keeping it alive rather than frozen.
 static void update_view_state(void) {
     if (!usage_group || !pair_group || !idle_group) return;
     int v;
-    if (!s_ble_connected) {
-        v = 0;  // pairing hint
+    if (!s_ble_connected && s_net == NET_OFF) {
+        v = 0;  // pairing hint — only when there's no WiFi path either
     } else if (data_received && data_ok && (lv_tick_get() - last_data_ms) < DATA_FRESH_MS) {
         v = 2;  // live usage
     } else {
@@ -1034,7 +1091,12 @@ void ui_tick_anim(void) {
     // Status text by priority. Whimsical messages only when connected & settled.
     const char* text;
     if (!s_ble_connected) {
-        text = "Waiting";              // advertising / waiting for a host connection
+        switch (s_net) {
+        case NET_WIFI:        text = "Joining WiFi"; break;
+        case NET_DISCOVERING: text = "Finding host"; break;
+        case NET_AUTH_FAIL:   text = "Re-run setup"; break;   // broker rejected our login
+        default:              text = "Waiting";      break;   // advertising / no host yet
+        }
     } else if (view_state == 1) {      // idle — alternate so it reads as alive AND data-less
         text = (anim_msg_idx & 1) ? "No data" : "Listening";
     } else if (now - connected_at_ms < 5000) {
@@ -1093,10 +1155,10 @@ screen_t ui_get_current_screen(void) {
     return current_screen;
 }
 
-void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
-    (void)name; (void)mac;
+void ui_update_link_status(bool ble_connected, net_state_t net) {
     bool was_connected = s_ble_connected;
-    s_ble_connected = (state == BLE_STATE_CONNECTED);
+    s_ble_connected = ble_connected || net == NET_CONNECTED;
+    s_net = net;
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
     // pair / idle / usage — picked from connection + data freshness.

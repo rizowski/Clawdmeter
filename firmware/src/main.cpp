@@ -257,7 +257,7 @@ void setup() {
     input_hal_init();
 
     ui_init();
-    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
+    ui_update_link_status(ble_get_state() == BLE_STATE_CONNECTED, net_get_state());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
 
@@ -266,6 +266,7 @@ void setup() {
 }
 
 static ble_state_t last_ble_state = BLE_STATE_INIT;
+static net_state_t last_net_state = NET_OFF;
 
 // Hold-to-pair gesture: hold the PWR button ~3s, then RELEASE → clear all BLE
 // bonds and re-advertise. Clearing on *release* (not while held) is deliberate:
@@ -409,9 +410,21 @@ void loop() {
     }
 
     ble_state_t bs = ble_get_state();
-    if (bs != last_ble_state) {
+    net_state_t ns = net_get_state();
+    if (bs != last_ble_state || ns != last_net_state) {
         last_ble_state = bs;
-        ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
+        last_net_state = ns;
+        ui_update_link_status(bs == BLE_STATE_CONNECTED, ns);
+    }
+
+    // Setup code: show while a clawdmeter-setup session is open; wake the
+    // panel so the digits are readable even if the device was dozing.
+    static bool code_shown = false;
+    bool code_vis = prov_code_visible();
+    if (code_vis != code_shown) {
+        code_shown = code_vis;
+        ui_show_setup_code(code_vis ? prov_code() : nullptr);
+        if (code_vis) idle_note_activity();
     }
 
     static int  last_pct      = -2;
