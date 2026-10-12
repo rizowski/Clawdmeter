@@ -2,7 +2,8 @@
 # Claude Usage Tracker Daemon (BLE)
 # Reads Claude Code OAuth token, polls usage via API, sends to ESP32 over BLE GATT.
 # Auto-connects and reconnects to the Clawdmeter BLE device.
-# Dependencies: curl, awk, bluetoothctl
+# Optional WiFi/MQTT transport: see daemon/broker/ and clawdmeter-setup.
+# Dependencies: curl, awk, bluetoothctl; for MQTT: mosquitto, mosquitto-clients, avahi-utils
 
 DEVICE_NAME="Clawdmeter"
 DEVICE_MAC="${DEVICE_MAC:-}"  # auto-discovered if empty
@@ -16,6 +17,14 @@ CONFIG_FILE="$HOME/.config/claude-usage-monitor/config"
 REFRESH_FLAG="/tmp/claude-usage-refresh-$$"
 DBUS_DEST="org.bluez"
 NOTIFY_PID=""
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+BROKER_DIR="$HOME/.config/claude-usage-monitor/broker"
+BROKER_PID=""
+AVAHI_PID=""
+MQTT_SUB_PID=""
+TRANSPORT="ble"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/broker/find-tool.sh"
 
 log() {
     echo "[$(date '+%H:%M:%S')] $1"
@@ -81,6 +90,21 @@ read_chime_setting() {
     case "$val" in
         on) echo "on" ;;
         *)  echo "off" ;;
+    esac
+}
+
+# Read the `transport` option: ble (default) | mqtt. clawdmeter-setup sets it
+# to mqtt once a device has reached the broker over WiFi, then restarts us.
+read_transport_setting() {
+    local val=""
+    if [ -f "$CONFIG_FILE" ]; then
+        val=$(sed -e 's/#.*//' "$CONFIG_FILE" \
+            | awk -F= 'tolower($1) ~ /^[[:space:]]*transport[[:space:]]*$/ {gsub(/[[:space:]]/, "", $2); print tolower($2)}' \
+            | tail -1)
+    fi
+    case "$val" in
+        mqtt) echo mqtt ;;
+        *)    echo ble ;;
     esac
 }
 
@@ -275,6 +299,68 @@ write_gatt() {
         WriteValue "aya{sv}" "$count" $bytes 0 2>/dev/null
 }
 
+# --- MQTT transport ---------------------------------------------------------
+# The broker + mDNS announcement run whenever broker-init.sh has been run (even
+# in BLE mode), because clawdmeter-setup needs the broker up to verify a device.
+# Clients log in via client.conf (-o): a password in argv is visible in ps.
+
+broker_ensure() {
+    if [ -n "$BROKER_PID" ] && kill -0 "$BROKER_PID" 2>/dev/null; then return 0; fi
+    local exe
+    exe=$(clawd_find_tool mosquitto) || { log "mosquitto not installed; WiFi devices can't connect"; return 1; }
+    "$exe" -c "$BROKER_DIR/mosquitto.conf" &
+    BROKER_PID=$!
+    echo "$BROKER_PID" > "$BROKER_DIR/broker.pid"
+    log "Broker started (pid=$BROKER_PID)"
+}
+
+announce_ensure() {
+    if [ -n "$AVAHI_PID" ] && kill -0 "$AVAHI_PID" 2>/dev/null; then return 0; fi
+    command -v avahi-publish-service >/dev/null || { log "avahi-publish-service missing; devices can't find the broker"; return 1; }
+    avahi-publish-service "Clawdmeter broker on $(hostname -s)" _clawdmeter._tcp "$BROKER_PORT" "id=$BROKER_ID" >/dev/null 2>&1 &
+    AVAHI_PID=$!
+    log "mDNS: announcing _clawdmeter._tcp on port $BROKER_PORT"
+}
+
+# Device refresh requests → the same flag file the BLE notify path uses.
+refresh_sub_ensure() {
+    if [ -n "$MQTT_SUB_PID" ] && kill -0 "$MQTT_SUB_PID" 2>/dev/null; then return 0; fi
+    setsid bash -c "mosquitto_sub -o '$BROKER_DIR/client.conf' -t 'clawdmeter/+/refresh' 2>/dev/null | while read -r _; do touch '$REFRESH_FLAG'; done" &
+    MQTT_SUB_PID=$!
+}
+
+side_services_tick() {
+    [ -n "${BROKER_ID:-}" ] || return 0
+    broker_ensure
+    announce_ensure
+}
+
+# Publish one payload, retained, to every device clawdmeter-setup has added.
+mqtt_publish() {
+    local payload="$1" dev rc=0
+    while read -r dev; do
+        [[ "$dev" =~ ^[0-9a-f]{6}$ ]] || continue
+        mosquitto_pub -o "$BROKER_DIR/client.conf" \
+            -q 1 -r -t "clawdmeter/$dev/usage" -m "$payload" || rc=1
+    done < "$BROKER_DIR/devices"
+    return $rc
+}
+
+send_payload() {
+    if [ "$TRANSPORT" = mqtt ]; then
+        mqtt_publish "$1"
+    else
+        write_gatt "$RX_CHAR_PATH" "$1"
+    fi
+}
+
+stop_mqtt_side() {
+    [ -n "$MQTT_SUB_PID" ] && kill -TERM -"$MQTT_SUB_PID" 2>/dev/null
+    [ -n "$AVAHI_PID" ] && kill "$AVAHI_PID" 2>/dev/null
+    [ -n "$BROKER_PID" ] && kill "$BROKER_PID" 2>/dev/null
+    rm -f "$BROKER_DIR/broker.pid"
+}
+
 # Build the device payload for one OAuth token. Echoes the JSON payload on
 # success (empty + non-zero return on failure). Pure: no logging, no GATT write
 # — poll() owns picking the active plan and sending it.
@@ -438,24 +524,59 @@ poll() {
         log "Active plan: $best_dir (s=$best_s)"
     fi
     log "Sending: ${cycle_payload[$best_dir]}"
-    write_gatt "$RX_CHAR_PATH" "${cycle_payload[$best_dir]}" || { log "Write failed"; return 1; }
+    send_payload "${cycle_payload[$best_dir]}" || { log "Send failed"; return 1; }
     return 0
 }
 
 cleanup() {
     stop_notify_subscriber
+    stop_mqtt_side
     log "Daemon stopped"
     exit 0
 }
 
 trap cleanup INT TERM
 
-log "=== Claude Usage Tracker Daemon (BLE) ==="
+log "=== Claude Usage Tracker Daemon ==="
 log "Poll interval: ${POLL_INTERVAL}s"
+
+if [ -f "$BROKER_DIR/broker.env" ]; then
+    # shellcheck disable=SC1091
+    . "$BROKER_DIR/broker.env"
+fi
+TRANSPORT=$(read_transport_setting)
+if [ "$TRANSPORT" = mqtt ] && [ -z "${BROKER_ID:-}" ]; then
+    log "transport = mqtt but no broker is set up; falling back to BLE"
+    TRANSPORT=ble
+fi
+
+if [ "$TRANSPORT" = mqtt ]; then
+    log "Transport: MQTT (WiFi)"
+    LAST_POLL=0
+    while true; do
+        side_services_tick
+        refresh_sub_ensure
+        NOW=$(date +%s)
+        if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
+            if [ -f "$REFRESH_FLAG" ]; then
+                log "Refresh requested by device"
+                rm -f "$REFRESH_FLAG"
+            fi
+            if [ ! -s "$BROKER_DIR/devices" ]; then
+                log "No WiFi devices set up yet; run daemon/clawdmeter-setup"
+                LAST_POLL=$NOW
+            else
+                poll && LAST_POLL=$NOW
+            fi
+        fi
+        sleep "$TICK"
+    done
+fi
 
 BACKOFF=1
 
 while true; do
+    side_services_tick
     # Find the device: only a device the system already knows (paired/connected).
     # We never scan by name, so we can't grab a stranger's or the wrong nearby
     # unit. Pair the device once first (it's a bonded BLE HID keyboard anyway).
@@ -495,6 +616,7 @@ while true; do
     # interval has elapsed OR when the ESP requested a refresh.
     LAST_POLL=0
     while is_connected; do
+        side_services_tick
         NOW=$(date +%s)
         if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
             if [ -f "$REFRESH_FLAG" ]; then
