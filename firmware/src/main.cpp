@@ -121,6 +121,7 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
+    strlcpy(out->plan, doc["pl"] | "", sizeof(out->plan));
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;

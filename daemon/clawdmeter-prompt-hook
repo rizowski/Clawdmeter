@@ -1,0 +1,48 @@
+#!/bin/sh
+# Claude Code UserPromptSubmit hook for Clawdmeter.
+#
+# Records which Claude config dir the latest prompt came from, so the daemon
+# shows that plan's usage (see `config_dirs` in the daemon config). Install it
+# with daemon/clawdmeter-hook-install, which adds it to each config dir's
+# settings.json.
+#
+# The config dir is, in order:
+#   1. $CLAUDE_CONFIG_DIR, when Claude Code was started with it set
+#   2. the first argument, if one is given (the installer passes none, so one
+#      entry serves config dirs that share a settings.json)
+#   3. the dir that holds the session transcript (<dir>/projects/...)
+#   4. ~/.claude
+#
+# Output goes to ~/.config/claude-usage-monitor/last-prompt (one line, the
+# dir). The hook prints nothing: Claude Code adds a UserPromptSubmit hook's
+# stdout to the prompt context. It always exits 0, so it can never block a
+# prompt.
+
+STATE_DIR="$HOME/.config/claude-usage-monitor"
+OUT="$STATE_DIR/last-prompt"
+
+input=$(cat 2>/dev/null)
+
+dir="${CLAUDE_CONFIG_DIR:-}"
+[ -z "$dir" ] && dir="${1:-}"
+if [ -z "$dir" ]; then
+    transcript=$(printf '%s' "$input" \
+        | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    case "$transcript" in
+        */projects/*) dir="${transcript%%/projects/*}" ;;
+    esac
+fi
+[ -z "$dir" ] && dir="$HOME/.claude"
+case "$dir" in
+    "~")   dir="$HOME" ;;
+    "~/"*) dir="$HOME/${dir#\~/}" ;;
+esac
+dir="${dir%/}"
+
+{
+    mkdir -p "$STATE_DIR" &&
+    printf '%s\n' "$dir" > "$OUT.tmp.$$" &&
+    mv -f "$OUT.tmp.$$" "$OUT"
+} >/dev/null 2>&1 || rm -f "$OUT.tmp.$$" 2>/dev/null
+
+exit 0

@@ -27,6 +27,8 @@ check '[ "$(read_transport_setting)" = ble ]' "unknown transport falls back to b
 # A failed send (broker down) still counts as a poll: at most one API call
 # per POLL_INTERVAL instead of one every TICK.
 eval "$(extract mqtt_tick)"
+eval "$(extract prompt_switch_due)"
+PROMPT_SWITCH=0
 POLL_INTERVAL=60
 REFRESH_MIN_GAP=15
 REFRESH_FLAG="$TMP/refresh"
@@ -43,6 +45,12 @@ touch "$REFRESH_FLAG"; mqtt_tick 2005; mqtt_tick 2010
 check '[ "$POLLS" -eq 0 ] && [ -f "$REFRESH_FLAG" ]' "refresh inside the gap is held, not polled"
 mqtt_tick 2015
 check '[ "$POLLS" -eq 1 ] && [ ! -f "$REFRESH_FLAG" ]' "held refresh is served once the gap passes"
+# A prompt in another plan polls early, with the same gap as a refresh.
+POLLS=0; LAST_POLL=3000; PROMPT_SWITCH=1
+mqtt_tick 3005
+check '[ "$POLLS" -eq 0 ] && [ "$PROMPT_SWITCH" = 1 ]' "prompt switch inside the gap is held"
+mqtt_tick 3015
+check '[ "$POLLS" -eq 1 ] && [ "$PROMPT_SWITCH" = 0 ]' "held prompt switch polls once the gap passes"
 
 # MQTT mode still offers each payload over BLE, for devices not on WiFi.
 eval "$(extract send_payload)"

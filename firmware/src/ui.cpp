@@ -224,6 +224,9 @@ static long     clock_base_epoch = 0;
 static uint32_t clock_base_ms = 0;
 static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
 static int      clock_last_min = -1;   // last rendered minute; avoids redrawing the title every tick
+// Plan name from the daemon ("Max", "Team"). When set it is the title, and
+// takes the place of the clock.
+static char     title_plan[12] = "";
 static lv_obj_t* usage_group;   // the two usage panels — shown when connected
 static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
 static lv_obj_t* bar_session;
@@ -268,6 +271,10 @@ static const uint32_t RB_COLORS[RB_COUNT] = {
 static bool     rainbow_session = false;
 static bool     rainbow_weekly = false;
 static uint8_t  rainbow_phase = 0;    // advances once per second
+// A window at its limit shows solid red (bar and percentage) and does not
+// rainbow: "you are locked out" must not look like the end-of-window party.
+static bool     maxed_session = false;
+static bool     maxed_weekly = false;
 // The plain text and color each label falls back to when its window is not
 // rainbowing. Cached because the rainbow overwrites the label text itself,
 // and because enterprise picks the weekly color from pace rather than pct.
@@ -859,12 +866,25 @@ static void realign_elapsed(void) {
         lv_obj_align_to(lbl_weekly_elapsed, lbl_weekly_pct, LV_ALIGN_OUT_RIGHT_TOP, 6, drop);
 }
 
+// Whole-label recolor markup in COL_RED, for a window at its limit. `src` is
+// a plain percentage ("100%"), so it has no spaces to upset the parser.
+static void set_red_text(lv_obj_t* lbl, const char* src) {
+    char out[32];
+    lv_color32_t c = lv_color_to_32(COL_RED, LV_OPA_COVER);
+    snprintf(out, sizeof(out), "#%02x%02x%02x %s#", c.red, c.green, c.blue, src);
+    lv_label_set_text(lbl, out);
+}
+
 static void apply_colors(void) {
     if (!bar_session || !bar_weekly) return;
 
     lv_color_t rb = lv_color_hex(RB_COLORS[rainbow_phase % RB_COUNT]);
 
-    if (rainbow_session) {
+    if (maxed_session) {
+        lv_obj_set_style_bg_color(bar_session, COL_RED, LV_PART_INDICATOR);
+        set_red_text(lbl_session_pct, txt_session_pct);
+        lv_label_set_text(lbl_session_reset, txt_session_reset);
+    } else if (rainbow_session) {
         lv_obj_set_style_bg_color(bar_session, rb, LV_PART_INDICATOR);
         set_rainbow_text(lbl_session_pct,   txt_session_pct,   rainbow_phase);
         set_rainbow_text(lbl_session_reset, txt_session_reset, rainbow_phase);
@@ -874,7 +894,11 @@ static void apply_colors(void) {
         lv_label_set_text(lbl_session_reset, txt_session_reset);
     }
 
-    if (rainbow_weekly) {
+    if (maxed_weekly) {
+        lv_obj_set_style_bg_color(bar_weekly, COL_RED, LV_PART_INDICATOR);
+        set_red_text(lbl_weekly_pct, txt_weekly_pct);
+        lv_label_set_text(lbl_weekly_reset, txt_weekly_reset);
+    } else if (rainbow_weekly) {
         lv_obj_set_style_bg_color(bar_weekly, rb, LV_PART_INDICATOR);
         set_rainbow_text(lbl_weekly_pct,   txt_weekly_pct,   rainbow_phase);
         set_rainbow_text(lbl_weekly_reset, txt_weekly_reset, rainbow_phase);
@@ -901,7 +925,15 @@ void ui_update(const UsageData* data) {
     } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
         clock_base_epoch = 0;
         clock_last_min = -1;
-        lv_label_set_text(lbl_title, "Usage");
+        if (!data->plan[0]) lv_label_set_text(lbl_title, "Usage");
+    }
+
+    // The plan name wins the title over the clock and over "Usage".
+    if (strcmp(title_plan, data->plan) != 0) {
+        strlcpy(title_plan, data->plan, sizeof(title_plan));
+        clock_last_min = -1;   // if the name went away, the clock redraws next tick
+        lv_label_set_text(lbl_title,
+                          title_plan[0] ? title_plan : clock_base_epoch > 0 ? "" : "Usage");
     }
 
     int s_pct = (int)(data->session_pct + 0.5f);
@@ -938,6 +970,27 @@ void ui_update(const UsageData* data) {
     // Each window rainbows through its own final stretch, independently.
     rainbow_session = elapsed_s >= 0 && data->session_reset_mins <= RAINBOW_5H_MINS;
     rainbow_weekly  = elapsed_w >= 0 && data->weekly_reset_mins  <= RAINBOW_7D_MINS;
+
+    // At the limit, red wins over the rainbow. Enterprise is left alone: its
+    // spending bar already goes red by level, and its lower bar is time.
+    maxed_session = !data->enterprise && data->session_pct >= 99.5f;
+    maxed_weekly  = !data->enterprise && data->weekly_pct  >= 99.5f;
+    if (maxed_session) rainbow_session = false;
+    if (maxed_weekly)  rainbow_weekly  = false;
+
+    // Out of usage (enterprise: spending at 100%): Clawd sleeps, and dreams
+    // on the splash. logo_img is the static corner icon, which only boards
+    // without the animated mascot have.
+    static bool was_asleep = false;
+    const bool asleep = maxed_session || maxed_weekly || data->session_pct >= 99.5f;
+    if (asleep != was_asleep) {
+        was_asleep = asleep;
+        splash_set_asleep(asleep);
+        if (logo_img) {
+            const lv_image_dsc_t* d = asleep ? splash_asleep_icon(L.small_icons ? 2 : 3) : nullptr;
+            lv_image_set_src(logo_img, d ? d : &logo_dsc);
+        }
+    }
 
     place_marker(marker_session, elapsed_s, bar_session_w, L.usage_top_bar_y);
     place_marker(marker_weekly,  elapsed_w, bar_weekly_w,  L.usage_bottom_bar_y);
@@ -1059,7 +1112,7 @@ void ui_tick_anim(void) {
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
-    if (clock_base_epoch > 0) {
+    if (clock_base_epoch > 0 && !title_plan[0]) {
         time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
         struct tm tmv;
         gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is

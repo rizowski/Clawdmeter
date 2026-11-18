@@ -10,9 +10,11 @@
 # active. Use this if you run separate plans from different config dirs (e.g. a
 # personal plan in ~/.claude and a work plan in ~/.claude-work, selected via
 # CLAUDE_CONFIG_DIR). Comma-separated; ~ is expanded.
-#   - The daemon polls every listed dir each cycle and displays the plan whose
-#     usage rose most recently (i.e. the one you're actively using). Before any
-#     change is seen it shows the plan with the highest current usage.
+#   - The daemon polls every listed dir each cycle and displays the plan you
+#     last sent a prompt in. This needs the Claude Code prompt hook. Add it with
+#     daemon/clawdmeter-hook-install <dir> <dir> ... (the installer offers it).
+#   - Without the hook, it displays the plan whose usage rose most recently.
+#     Before any change is seen it shows the plan with the highest current usage.
 #   - Unset (default) = just ~/.claude, unchanged single-plan behavior.
 #   - install.sh can detect your ~/.claude* dirs and fill this in for you.
 # config_dirs = ~/.claude, ~/.claude-work

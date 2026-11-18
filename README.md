@@ -225,6 +225,35 @@ rules limit it to its own topics. After 5 wrong setup codes, setup is locked for
 Your Anthropic token and your computer's credentials never leave your computer.
 The worst case is someone on your network reading or faking the usage numbers.
 
+## More than one Claude plan (macOS and Linux)
+
+You can run Claude Code against more than one config dir, for example
+`~/.claude` for a personal plan and `~/.claude-work` for a work plan (selected
+with `CLAUDE_CONFIG_DIR`). List the dirs in the daemon configuration file
+(`~/.config/claude-usage-monitor/config`):
+
+```
+config_dirs = ~/.claude, ~/.claude-work
+```
+
+The device then shows the plan that you last sent a prompt in. A Claude Code
+hook (a command that Claude Code runs on an event) supplies this information.
+The installer offers to add the hook when `config_dirs` lists two or more dirs.
+To add it yourself, run:
+
+```bash
+daemon/clawdmeter-hook-install ~/.claude ~/.claude-work
+```
+
+The tool adds a `UserPromptSubmit` hook to the `settings.json` file of each
+dir and keeps all your other settings. The hook writes the dir of each prompt
+to `~/.config/claude-usage-monitor/last-prompt`. When you prompt in a different
+plan, the device changes to that plan in about 5 to 15 seconds. To remove the
+hook, run the same command with `--remove` before the dirs.
+
+Without the hook, the daemon guesses the plan. It shows the plan whose session
+usage went up most recently, so a change can take a minute or more to show.
+
 ## How it works
 
 <img src="assets/readme/magnifier.gif" width="150" align="right" alt="">

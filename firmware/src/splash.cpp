@@ -160,6 +160,295 @@ static void anim_reset(const splash_anim_def_t *a) {
 static const uint8_t* compose_stage(const splash_anim_def_t *a, uint16_t frame);
 static void render_frame(const uint8_t *cells, const uint16_t *palette);
 
+// ─── Asleep and dreaming (usage at its limit) ────────────────────────────────
+// Out of usage, Clawd lies down and sleeps until the window resets. No
+// official lying-down Clawd exists, so the pose is derived at boot from an
+// official frame: the turned Clawd of the walk wind-up (walking frame 1),
+// laid on his back with his head to the right, legs out to the left and his
+// face to the sky, each eye closed to a line. Those eye lines and the three
+// thought-bubble dots are the only authored cells.
+//
+// On the splash he sleeps at the bottom of the stage and dreams: a story of
+// official clips plays above him, raised DREAM_SHIFT cells to make room.
+// Three stories of about a minute each play in turn, with a short dreamless
+// pause between them. The corner mascot shows the sleeping pose only.
+#define SLEEP_MAX_CELLS (32 * 24)
+static uint8_t  sleep_cells[SLEEP_MAX_CELLS];   // walking-palette codes
+static const uint16_t sleep_holds[1] = { 1000 };
+static splash_anim_def_t sleep_def;
+static bool sleep_ok = false;      // pose built
+static bool s_asleep = false;      // currently asleep
+static int  still_cols = 0;        // size of the standing Clawd, cells: the
+static int  still_rows = 0;        // corner slot the lying pose must fit
+
+typedef struct { const char *anim; uint16_t ms; } dream_beat_t;
+#define DREAM_STORIES    3
+#define DREAM_MAX_BEATS  6
+// A beat holds its clip's loop for `ms`, then lets the outro play. Every clip
+// starts and ends on the shared idle pose, so beats cut together cleanly.
+static const dream_beat_t DREAMS[DREAM_STORIES][DREAM_MAX_BEATS] = {
+    // Game Day: walks out, plays, and celebrates the win.
+    { {"walking", 5000}, {"soccer", 10000}, {"basketball", 10000},
+      {"skateboard", 9000}, {"trumpet", 11000}, {"jumping happy", 8000} },
+    // The Voyage: searches, sets sail, flies, races home, waves goodbye.
+    { {"magnifier", 9000}, {"sailing scene", 13000}, {"cloud", 12000},
+      {"racing car", 12000}, {"waving", 6000}, {NULL, 0} },
+    // The Bakery: finishes work, bakes, eats, dances it off.
+    { {"laptop", 12000}, {"baking", 15000}, {"eating", 13000},
+      {"dancing", 13000}, {NULL, 0}, {NULL, 0} },
+};
+#define DREAM_PAUSE_MS   4000      // dreamless sleep between stories
+#define DREAM_DOT_MS      350      // bubble dots appear one at a time
+#define DREAM_SHIFT      (-15)     // scenes rise this many rows (tallest is 33)
+#define DREAM_SLEEP_BOTTOM (GRID - 1)          // the row he lies on
+#define DREAM_DOT_COLOR  0x8C51    // official steam gray #8B8B8B
+
+static uint8_t  dr_story = 0;
+static int8_t   dr_beat = -1;              // -1 = dreamless pause
+static const splash_anim_def_t *dr_anim = NULL;
+static uint16_t dr_frame = 0;
+static uint32_t dr_frame_started = 0;
+static uint32_t dr_beat_started = 0;
+static uint32_t dr_story_started = 0;      // also the pause start
+static uint8_t  dr_dots = 0;
+static bool     dr_dirty = false;
+static uint16_t dream_pal[SPLASH_PALETTE_SIZE];
+static uint8_t  dream_map[SPLASH_PALETTE_SIZE];   // sleeper code -> dream_pal slot
+static uint8_t  dream_dot_idx = 1;
+
+static const splash_anim_def_t* find_anim(const char *n) {
+    if (!n) return NULL;
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++)
+        if (strcmp(splash_anims[i].name, n) == 0) return &splash_anims[i];
+    return NULL;
+}
+
+// Ink = the converter's eye color (near black), as opposed to body or shade.
+static bool is_ink(uint16_t c) {
+    return ((c >> 11) & 31) + ((c >> 6) & 31) + (c & 31) < 12;
+}
+
+static void build_sleep_pose(void) {
+    const splash_anim_def_t *a = find_anim("walking");
+    if (!a || a->frame_count == 0 || (int)a->w * a->h > SLEEP_MAX_CELLS) return;
+    const int w = a->w, h = a->h;
+    uint8_t up[SLEEP_MAX_CELLS];
+    // Frame 1 is the walk wind-up: standing, turned to face right.
+    memcpy(up, &a->frames[(size_t)(a->frame_count > 1 ? 1 : 0) * w * h], (size_t)w * h);
+    #define UP_INK(X, Y) (up[(Y) * w + (X)] && up[(Y) * w + (X)] < SPLASH_PALETTE_SIZE && \
+                          is_ink(a->palette[up[(Y) * w + (X)]]))
+
+    // Close the eyes. Each eye is a small block of ink cells: fill it with
+    // the body cell beside it and leave a line on its bottom row, one cell
+    // longer on each side (where there is body to draw on).
+    int x = 0;
+    while (x < w) {
+        int y0 = h, y1 = -1;
+        for (int y = 0; y < h; y++)
+            if (UP_INK(x, y)) { if (y < y0) y0 = y; if (y > y1) y1 = y; }
+        if (y1 < 0) { x++; continue; }
+        int x1 = x;                                   // extend the block right
+        while (x1 + 1 < w) {
+            bool more = false;
+            for (int y = y0; y <= y1; y++) if (UP_INK(x1 + 1, y)) more = true;
+            if (!more) break;
+            x1++;
+        }
+        const uint8_t ink = up[y1 * w + x];
+        uint8_t skin = (x > 0) ? up[y1 * w + x - 1] : 0;
+        if (!skin && x1 + 1 < w) skin = up[y1 * w + x1 + 1];
+        for (int yy = y0; yy <= y1; yy++)
+            for (int xx = x; xx <= x1; xx++) up[yy * w + xx] = skin;
+        for (int xx = x - 1; xx <= x1 + 1; xx++)
+            if (xx >= 0 && xx < w && up[y1 * w + xx]) up[y1 * w + xx] = ink;
+        x = x1 + 2;
+    }
+    #undef UP_INK
+
+    // Occupied box of the standing pose.
+    int r0 = h, r1 = -1, c0 = w, c1 = -1;
+    for (int y = 0; y < h; y++)
+        for (int xx = 0; xx < w; xx++)
+            if (up[y * w + xx]) {
+                if (y < r0) r0 = y;
+                if (y > r1) r1 = y;
+                if (xx < c0) c0 = xx;
+                if (xx > c1) c1 = xx;
+            }
+    if (r1 < 0) return;
+    const int bw = c1 - c0 + 1, bh = r1 - r0 + 1;
+    still_cols = w;
+    still_rows = bh;
+
+    // Lay him down: head (top) to the right, legs to the left, and the side
+    // he faces (right) to the sky. The lying sprite is bh wide and bw tall.
+    for (int y = 0; y < bh; y++)
+        for (int xx = 0; xx < bw; xx++)
+            sleep_cells[(bw - 1 - xx) * bh + (bh - 1 - y)] = up[(r0 + y) * w + c0 + xx];
+
+    sleep_def = *a;
+    sleep_def.name = "asleep";
+    sleep_def.w = (uint8_t)bh;
+    sleep_def.h = (uint8_t)bw;
+    sleep_def.frame_count = 1;
+    sleep_def.loop_start = 0;
+    sleep_def.loop_end = 0;
+    sleep_def.frames = sleep_cells;
+    sleep_def.holds = sleep_holds;
+    sleep_ok = true;
+}
+
+// Px per cell for the lying pose in a corner slot sized for the standing
+// Clawd at `px` per cell: lying he is taller, so he is drawn smaller.
+static int sleep_slot_cell(int px) {
+    int c = (still_rows * px) / sleep_def.h;
+    return c < 1 ? 1 : c;
+}
+
+static uint8_t dream_pal_slot(uint16_t color, uint8_t used) {
+    for (uint8_t i = 1; i < used; i++) if (dream_pal[i] == color) return i;
+    if (used < SPLASH_PALETTE_SIZE) { dream_pal[used] = color; return used; }
+    // Palette full: nearest existing color.
+    uint8_t best = 1; int best_d = 1 << 30;
+    for (uint8_t i = 1; i < SPLASH_PALETTE_SIZE; i++) {
+        const int dr = ((dream_pal[i] >> 11) & 31) - ((color >> 11) & 31);
+        const int dg = (((dream_pal[i] >> 5) & 63) - ((color >> 5) & 63)) / 2;
+        const int db = (dream_pal[i] & 31) - (color & 31);
+        const int d = dr * dr + dg * dg + db * db;
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return best;
+}
+
+// The scene's palette plus the sleeper's colors and the bubble gray.
+static void dream_set_palette(const splash_anim_def_t *scene) {
+    const splash_anim_def_t *src = scene ? scene : &sleep_def;
+    memcpy(dream_pal, src->palette, sizeof(dream_pal));
+    uint8_t used = src->palette_count;
+    if (used < 1) used = 1;
+    if (used > SPLASH_PALETTE_SIZE) used = SPLASH_PALETTE_SIZE;
+    for (int c = 0; c < SPLASH_PALETTE_SIZE; c++) {
+        const uint16_t col = sleep_def.palette[c];
+        // Closed eyes are background black, which every palette has at 0.
+        if (c == 0 || c >= sleep_def.palette_count || is_ink(col)) { dream_map[c] = 0; continue; }
+        dream_map[c] = dream_pal_slot(col, used);
+        if (dream_map[c] >= used) used = dream_map[c] + 1;
+    }
+    dream_dot_idx = dream_pal_slot(DREAM_DOT_COLOR, used);
+}
+
+static const uint8_t* compose_dream(void) {
+    memset(stage_cells, 0, sizeof(stage_cells));
+    const int sw = sleep_def.w;
+    const int sx = (GRID - sw) / 2;                       // sleeper, centered
+    const int sh = sleep_def.h;
+    const int sy = DREAM_SLEEP_BOTTOM - sh + 1;           // his top row
+
+    if (dr_anim) {                                        // the dream scene
+        const splash_anim_def_t *a = dr_anim;
+        int ax = STAGE_ANCHOR_X + a->ox;                  // same edge snap as
+        if (a->ox == 0)         ax = 0;                   // compose_stage
+        if (a->ox + a->w == 55) ax = GRID - a->w;
+        const int ay = STAGE_ANCHOR_Y + a->oy + DREAM_SHIFT;
+        const uint8_t *src = &a->frames[(size_t)dr_frame * a->w * a->h];
+        for (int r = 0; r < a->h; r++) {
+            const int dy = ay + r;
+            if (dy < 0 || dy >= sy) continue;             // never onto the sleeper
+            int c0 = 0, c1 = a->w;
+            if (ax + c0 < 0)    c0 = -ax;
+            if (ax + c1 > GRID) c1 = GRID - ax;
+            if (c0 < c1) memcpy(&stage_cells[dy * GRID + ax + c0], &src[r * a->w + c0], c1 - c0);
+        }
+        // Thought bubbles: 1, 2, 3-cell dots rising from his head to the
+        // dream. Drawn only on empty cells, so a wide scene stays intact.
+        static const int8_t DOTS[3][3] = {    // {dx from his head (right edge), dy from his top, size}
+            { 1, 8, 1 }, { 3, 4, 2 }, { 6, -1, 3 },
+        };
+        for (int d = 0; d < dr_dots && d < 3; d++) {
+            const int n = DOTS[d][2];
+            const int x0 = sx + sw + DOTS[d][0], y0 = sy + DOTS[d][1];
+            for (int yy = y0; yy < y0 + n; yy++)
+                for (int xx = x0; xx < x0 + n; xx++)
+                    if (yy >= 0 && yy < GRID && xx >= 0 && xx < GRID &&
+                        !stage_cells[yy * GRID + xx])
+                        stage_cells[yy * GRID + xx] = dream_dot_idx;
+        }
+    }
+
+    for (int r = 0; r < sh; r++) {                        // the sleeper
+        const int dy = sy + r;
+        if (dy < 0 || dy >= GRID) continue;
+        for (int c = 0; c < sw; c++) {
+            const uint8_t code = sleep_cells[r * sw + c];
+            if (code && code < SPLASH_PALETTE_SIZE)
+                stage_cells[dy * GRID + sx + c] = dream_map[code];
+        }
+    }
+    return stage_cells;
+}
+
+static void dream_force_repaint(void);
+
+// Start beat `b` of the current story, skipping clips this build lacks.
+// Past the last beat the story ends: dreamless pause, then the next story.
+static void dream_start_beat(int b) {
+    const uint32_t now = millis();
+    dr_anim = NULL;
+    while (b < DREAM_MAX_BEATS && DREAMS[dr_story][b].anim &&
+           !(dr_anim = find_anim(DREAMS[dr_story][b].anim))) b++;
+    if (!dr_anim) {
+        dr_beat = -1;
+        dr_story = (dr_story + 1) % DREAM_STORIES;
+        dr_story_started = now;
+        dr_dots = 0;
+    } else {
+        if (dr_beat < 0) { dr_story_started = now; dr_dots = 0; }
+        dr_beat = (int8_t)b;
+        dr_frame = 0;
+        dr_frame_started = now;
+        dr_beat_started = now;
+    }
+    dream_set_palette(dr_anim);
+    dream_force_repaint();          // the palette changed under the same pointer
+    dr_dirty = true;
+}
+
+static void dream_render(void) {
+    dr_dirty = false;
+    render_frame(compose_dream(), dream_pal);
+}
+
+static void dream_tick(uint32_t now) {
+    if (dr_beat < 0) {                                  // dreamless pause
+        if (now - dr_story_started >= DREAM_PAUSE_MS) dream_start_beat(0);
+    } else {
+        const splash_anim_def_t *a = dr_anim;
+        uint8_t dots = (uint8_t)((now - dr_story_started) / DREAM_DOT_MS);
+        if (dots > 3) dots = 3;
+        if (dots != dr_dots) { dr_dots = dots; dr_dirty = true; }
+        if (now - dr_frame_started >= a->holds[dr_frame]) {
+            const bool hold = now - dr_beat_started < DREAMS[dr_story][dr_beat].ms;
+            uint16_t next = dr_frame + 1;
+            if (dr_frame == a->loop_end && hold) next = a->loop_start;
+            if (next >= a->frame_count) {
+                dream_start_beat(dr_beat + 1);          // clip done: next beat
+            } else {
+                dr_frame = next;
+                dr_frame_started = now;
+                dr_dirty = true;
+            }
+        }
+    }
+    if (dr_dirty) dream_render();
+}
+
+// Draw `a`'s first frame, or the dream while he is asleep. Every path that
+// (re)starts an animation goes through here.
+static void render_first(const splash_anim_def_t *a) {
+    if (s_asleep && sleep_ok) { dream_render(); return; }
+    render_frame(compose_stage(a, 0), a->palette);
+}
+
 // Start walking toward `target` (stage x of the frame origin).
 static void walk_begin(int target) {
     if (target == walk_x) return;          // already there; stay standing
@@ -347,6 +636,12 @@ static void render_frame(const uint8_t *cells, const uint16_t *palette) {
 }
 #endif
 
+static void dream_force_repaint(void) {
+#if SPLASH_DIRECT_DRAW
+    force_full = true;
+#endif
+}
+
 // ---- Mini creature: a small animated creature for embedding in other screens
 //      (e.g. the idle "sleeping" indicator). Self-contained — its own canvas and
 //      buffer, independent of the full-screen splash above. ----
@@ -430,7 +725,7 @@ static int  mas_lurk_cell = 8;
 static int  mas_screen_w = 480;
 static bool mas_visible = false;
 
-enum MasMode { MAS_STILL, MAS_ACT, MAS_WALK_OFF, MAS_LURK, MAS_WALK_IN };
+enum MasMode { MAS_STILL, MAS_ACT, MAS_WALK_OFF, MAS_LURK, MAS_WALK_IN, MAS_ASLEEP };
 static MasMode mas_mode = MAS_STILL;
 static const splash_anim_def_t *mas_anim = NULL;
 static uint16_t mas_frame = 0;
@@ -503,6 +798,21 @@ static void mas_show_still(void) {
                    mas_cell, mas_x, mas_feet_y);
 }
 
+// Usage at its limit: he sleeps in the slot until splash_set_asleep(false).
+static void mas_show_asleep(void) {
+    if (!mas_img || !sleep_ok) return;
+    if (mas_lurk_img) lv_obj_add_flag(mas_lurk_img, LV_OBJ_FLAG_HIDDEN);   // mid-trip
+    if (mas_visible)  lv_obj_clear_flag(mas_img, LV_OBJ_FLAG_HIDDEN);
+    mas_anim = &sleep_def;
+    mas_frame = 0;
+    mas_mode = MAS_ASLEEP;
+    mas_mode_started = millis();
+    mas_x = mas_slot_x;
+    mas_face = +1;
+    mas_render(&sleep_def, 0, false, &mas_dsc, mas_buf, mas_img,
+               sleep_slot_cell(mas_cell), mas_x, mas_feet_y);
+}
+
 lv_obj_t* splash_mascot_create(lv_obj_t *parent, int slot_x, int feet_y, int cell) {
     mas_cell = cell;
     mas_slot_x = slot_x;
@@ -538,7 +848,8 @@ void splash_mascot_set_visible(bool v) {
         // siblings (battery icon, labels) whenever he's shown.
         lv_obj_move_foreground(mas_img);
         if (mas_lurk_img) lv_obj_move_foreground(mas_lurk_img);
-        mas_show_still();                       // restart clean at the slot
+        if (s_asleep && sleep_ok) mas_show_asleep();
+        else                   mas_show_still();   // restart clean at the slot
     } else {
         lv_obj_add_flag(mas_img, LV_OBJ_FLAG_HIDDEN);
         if (mas_lurk_img) lv_obj_add_flag(mas_lurk_img, LV_OBJ_FLAG_HIDDEN);
@@ -547,6 +858,7 @@ void splash_mascot_set_visible(bool v) {
 
 void splash_mascot_tick(void) {
     if (!mas_img || !mas_visible || !mas_anim) return;
+    if (mas_mode == MAS_ASLEEP) return;
     const uint32_t now = millis();
 
     if (mas_mode == MAS_STILL) {
@@ -729,6 +1041,7 @@ void splash_init(lv_obj_t *parent) {
     lv_obj_center(label_status);
 
     resolve_group_lists();
+    build_sleep_pose();
 
     if (SPLASH_ANIM_COUNT == 0) {
         show_placeholder();
@@ -750,6 +1063,14 @@ void splash_init(lv_obj_t *parent) {
 void splash_tick(void) {
     if (!active || SPLASH_ANIM_COUNT == 0) return;
     const uint32_t now = millis();
+
+    if (s_asleep && sleep_ok) {        // asleep: only the dream advances
+#if SPLASH_DIRECT_DRAW
+        if (force_full) dr_dirty = true;       // repaint after a (re)show
+#endif
+        dream_tick(now);
+        return;
+    }
 
 #if SPLASH_DIRECT_DRAW
     // Deferred full repaint after a (re)show — runs now that LVGL has drawn the
@@ -831,13 +1152,19 @@ void splash_tick(void) {
 
 void splash_next(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
+    if (s_asleep && sleep_ok) {                // asleep: skip to the next dream
+        if (dr_beat >= 0) dr_story = (dr_story + 1) % DREAM_STORIES;
+        dr_beat = -1;
+        dream_start_beat(0);
+        return;
+    }
     cur_anim = (cur_anim + 1) % SPLASH_ANIM_COUNT;
     cur_frame = 0;
     frame_started_ms = millis();
     last_pick_ms = frame_started_ms;
     const splash_anim_def_t *a = &splash_anims[cur_anim];
     anim_reset(a);
-    render_frame(compose_stage(a, 0), a->palette);
+    render_first(a);
     Serial.printf("splash: -> %s\n", a->name);
 }
 
@@ -858,7 +1185,68 @@ void splash_pick_for_current_rate(void) {
     last_pick_ms = frame_started_ms;
     const splash_anim_def_t *a = &splash_anims[cur_anim];
     anim_reset(a);
-    render_frame(compose_stage(a, 0), a->palette);
+    render_first(a);
+}
+
+void splash_set_asleep(bool asleep) {
+    if (asleep == s_asleep) return;
+    s_asleep = asleep;
+    if (!sleep_ok) return;
+    if (asleep) {
+        dr_beat = -1;                            // doze off, then dream
+        dr_anim = NULL;
+        dr_dots = 0;
+        dr_story_started = millis();
+        dream_set_palette(NULL);
+        dream_force_repaint();
+        dr_dirty = true;                         // splash_tick paints him
+        if (mas_img) mas_show_asleep();
+    } else {
+        if (active) splash_pick_for_current_rate();   // wake up
+        if (mas_img) mas_show_still();
+    }
+}
+
+const lv_image_dsc_t* splash_asleep_icon(int px_per_cell) {
+    static lv_image_dsc_t dsc;
+    static uint8_t *buf = NULL;
+    static int built_cell = 0;
+    if (!sleep_ok || px_per_cell < 1) return NULL;
+    if (buf && built_cell == px_per_cell) return &dsc;
+    // Same size as the standing still icon; he lies at its bottom left.
+    const int w = still_cols * px_per_cell, h = still_rows * px_per_cell;
+    const int pc = sleep_slot_cell(px_per_cell);
+    const int top = h - sleep_def.h * pc;
+    if (top < 0 || sleep_def.w * pc > w) return NULL;
+    if (buf) { heap_caps_free(buf); buf = NULL; }
+    buf = (uint8_t*)heap_caps_malloc((size_t)w * h * 3, MALLOC_CAP_8BIT);
+    if (!buf) return NULL;
+    uint16_t *color = (uint16_t*)buf;
+    uint8_t  *alpha = buf + (size_t)w * h * 2;
+    memset(buf, 0, (size_t)w * h * 3);
+    for (int gy = 0; gy < sleep_def.h; gy++) {
+        for (int gx = 0; gx < sleep_def.w; gx++) {
+            uint8_t code = sleep_cells[gy * sleep_def.w + gx];
+            if (!code) continue;
+            uint16_t c = (code < SPLASH_PALETTE_SIZE) ? sleep_def.palette[code] : 0;
+            for (int dy = 0; dy < pc; dy++)
+                for (int dx = 0; dx < pc; dx++) {
+                    const int i = (top + gy * pc + dy) * w + gx * pc + dx;
+                    color[i] = c;
+                    alpha[i] = 255;
+                }
+        }
+    }
+    memset(&dsc, 0, sizeof(dsc));
+    dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    dsc.header.w = w;
+    dsc.header.h = h;
+    dsc.header.cf = LV_COLOR_FORMAT_RGB565A8;
+    dsc.header.stride = w * 2;
+    dsc.data = buf;
+    dsc.data_size = (size_t)w * h * 3;
+    built_cell = px_per_cell;
+    return &dsc;
 }
 
 bool splash_is_active(void) { return active; }

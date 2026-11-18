@@ -62,6 +62,27 @@ def test_token_for_default_dir_falls_back_to_keychain_on_macos(tmp_path, monkeyp
         assert read_token_for(tmp_path) == "TOK_KEYCHAIN"
 
 
+def test_keychain_service_default_dir_is_bare_name(monkeypatch):
+    assert mod.keychain_service_for(mod.DEFAULT_CONFIG_DIR) == "Claude Code-credentials"
+
+
+def test_keychain_service_other_dir_is_hashed():
+    # Claude Code names a CLAUDE_CONFIG_DIR dir's entry by sha256(path)[:8].
+    import hashlib
+    d = Path("/Users/someone/.claude-work")
+    h = hashlib.sha256(b"/Users/someone/.claude-work").hexdigest()[:8]
+    assert mod.keychain_service_for(d) == f"Claude Code-credentials-{h}"
+
+
+def test_token_for_other_dir_reads_its_keychain_entry_on_macos(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    seen = []
+    with patch.object(mod, "_read_token_keychain",
+                      side_effect=lambda svc: seen.append(svc) or "TOK_WORK"):
+        assert read_token_for(tmp_path) == "TOK_WORK"
+    assert seen == [mod.keychain_service_for(tmp_path)]
+
+
 def test_token_for_file_wins_over_keychain(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "DEFAULT_CONFIG_DIR", tmp_path)
     monkeypatch.setattr(mod.sys, "platform", "darwin")
@@ -199,3 +220,97 @@ def test_discover_target_non_darwin_returns_none_without_pin(monkeypatch):
     monkeypatch.setattr(mod.sys, "platform", "linux")
     monkeypatch.setattr(mod, "load_cached_address", lambda: None)
     assert _run(mod.discover_target()) is None
+
+
+# ---------------------------------------------------------------------------
+# poll_api: a plan at its limit answers 429 with the usage headers
+# ---------------------------------------------------------------------------
+
+class _FakeHttp:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, *args, **kwargs):
+        return self._resp
+
+
+def _poll_with(status, headers):
+    import httpx
+    resp = httpx.Response(status, headers=headers, text="{}")
+    with patch.object(mod.httpx, "AsyncClient", new=lambda **kw: _FakeHttp(resp)):
+        return _run(mod.poll_api("TOK"))
+
+
+def test_poll_api_reads_usage_from_429_at_the_limit():
+    payload = _poll_with(429, {
+        "anthropic-ratelimit-unified-5h-utilization": "1.02",
+        "anthropic-ratelimit-unified-5h-reset": "0",
+        "anthropic-ratelimit-unified-5h-status": "rejected",
+        "anthropic-ratelimit-unified-7d-utilization": "0.4",
+        "anthropic-ratelimit-unified-7d-reset": "0",
+    })
+    assert payload is not None
+    assert payload["s"] == 100          # clamped: the header reports 1.02
+    assert payload["w"] == 40
+    assert payload["st"] == "rejected"
+    assert payload["acct"] == "pro"
+
+
+def test_poll_api_429_without_usage_headers_is_transient():
+    assert _poll_with(429, {}) is None
+
+
+def test_poll_api_500_with_usage_headers_is_still_transient():
+    assert _poll_with(500, {"anthropic-ratelimit-unified-5h-utilization": "0.5"}) is None
+
+
+# ---------------------------------------------------------------------------
+# plan name ("pl") — the device shows it as the title
+# ---------------------------------------------------------------------------
+
+def test_extract_plan_name_from_nested_blob():
+    blob = '{"claudeAiOauth": {"accessToken": "T", "subscriptionType": "team"}}'
+    assert mod._extract_plan_name(blob) == "Team"
+
+
+def test_extract_plan_name_unknown_and_missing():
+    assert mod._extract_plan_name('{"claudeAiOauth": {"subscriptionType": "max_ultra_plus"}}') == "Max Ultra P"
+    assert mod._extract_plan_name('{"claudeAiOauth": {"accessToken": "T"}}') == ""
+    assert mod._extract_plan_name("sk-ant-raw-token") == ""
+
+
+def test_read_plan_for_reads_credentials_file(tmp_path):
+    (tmp_path / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "T", "subscriptionType": "max"}}')
+    assert mod.read_plan_for(tmp_path) == "Max"
+
+
+def test_poll_active_adds_plan_of_the_active_dir(monkeypatch):
+    A, B = Path("/a"), Path("/b")
+    monkeypatch.setattr(mod, "read_config_dirs", lambda: [A, B])
+    monkeypatch.setattr(mod, "read_token_for", lambda d: {A: "tA", B: "tB"}[d])
+    monkeypatch.setattr(mod, "read_plan_for", lambda d: {A: "Max", B: "Team"}[d])
+    monkeypatch.setattr(mod, "read_last_prompt_dir", lambda: B)
+
+    async def fake_poll(token):
+        return {"s": 10, "ok": True}
+    monkeypatch.setattr(mod, "poll_api", fake_poll)
+    assert _run(mod.poll_active_payload(PlanSelector()))["pl"] == "Team"
+
+
+def test_poll_active_omits_plan_when_unknown(monkeypatch):
+    A = Path("/a")
+    monkeypatch.setattr(mod, "read_config_dirs", lambda: [A])
+    monkeypatch.setattr(mod, "read_token_for", lambda d: "tA")
+    monkeypatch.setattr(mod, "read_plan_for", lambda d: "")
+
+    async def fake_poll(token):
+        return {"s": 10, "ok": True}
+    monkeypatch.setattr(mod, "poll_api", fake_poll)
+    assert "pl" not in _run(mod.poll_active_payload(PlanSelector()))

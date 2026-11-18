@@ -46,3 +46,14 @@ void splash_mini_tick(void);
 lv_obj_t* splash_mascot_create(lv_obj_t *parent, int slot_x, int feet_y, int cell);
 void splash_mascot_tick(void);
 void splash_mascot_set_visible(bool v);
+
+// Usage at its limit: Clawd lies down asleep (an official frame laid on his
+// back, face up, eyes shut) until this is cleared. On the splash he dreams: three stories of
+// official clips, about a minute each, play above him in turn. The corner
+// mascot shows the sleeping pose only.
+void splash_set_asleep(bool asleep);
+
+// The sleeping pose as a static RGB565A8 image, for boards whose corner mascot
+// is the static clawd_still.h icon (no PSRAM). Same size as that icon at the
+// same px per cell. NULL when the pose or the buffer is unavailable.
+const lv_image_dsc_t* splash_asleep_icon(int px_per_cell);

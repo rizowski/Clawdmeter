@@ -37,15 +37,22 @@ upsert_config_key() {
 
 # Detect ~/.claude* config dirs and, if more than one is found, let the user pick
 # which plans to show. The daemon polls all chosen dirs and displays whichever is
-# active. macOS note: the default ~/.claude stores its token in Keychain (often no
-# .credentials.json file), so it always counts as a candidate; additional dirs are
-# recognised by their credentials file — matching the daemon's read_token_for.
+# active. macOS note: Claude Code stores tokens in Keychain (often no
+# .credentials.json file). The default ~/.claude always counts as a candidate;
+# another dir counts when it has a credentials file or a Keychain entry named
+# "Claude Code-credentials-<sha256(dir)[:8]>" — matching the daemon's read_token_for.
+_has_keychain_token() {
+    local h
+    h=$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)
+    security find-generic-password -s "Claude Code-credentials-$h" >/dev/null 2>&1
+}
+
 configure_config_dirs() {
     local -a candidates=()
     local d
     for d in "$HOME"/.claude*; do
         [ -d "$d" ] || continue
-        if [ -f "$d/.credentials.json" ] || [ "$d" = "$HOME/.claude" ]; then
+        if [ -f "$d/.credentials.json" ] || [ "$d" = "$HOME/.claude" ] || _has_keychain_token "$d"; then
             candidates+=("$d")
         fi
     done
@@ -132,6 +139,36 @@ configure_chime() {
     fi
 }
 
+# With more than one plan configured, offer the Claude Code prompt hook. It
+# tells the daemon which config dir you last prompted in, so the device shows
+# that plan right away instead of guessing from whose usage rose last.
+configure_prompt_hook() {
+    local raw py ans d
+    raw=$(current_config_value config_dirs)
+    [ -n "$raw" ] || return 0
+    local -a dirs=()
+    local IFS=','
+    for d in $raw; do
+        d=$(echo "$d" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        [ -n "$d" ] && dirs+=("${d/#\~/$HOME}")
+    done
+    unset IFS
+    [ ${#dirs[@]} -ge 2 ] || return 0
+    py="${PYTHON3:-$(command -v python3)}"
+    if [ ! -t 0 ] || [ -z "$py" ]; then
+        echo "  To show the plan you last prompted in, run:"
+        echo "    $SCRIPT_DIR/daemon/clawdmeter-hook-install ${dirs[*]}"
+        return 0
+    fi
+    read -r -p "  Show the plan you last prompted in (adds a Claude Code hook)? [Y/n] " ans || ans=""
+    if [[ "$ans" =~ ^[Nn]$ ]]; then
+        echo "  Hook skipped; the daemon guesses the plan from usage."
+        return 0
+    fi
+    "$py" "$SCRIPT_DIR/daemon/clawdmeter-hook-install" "${dirs[@]}" \
+        || echo "  Warning: some settings.json files were not changed (see above)."
+}
+
 echo "=== Clawdmeter macOS install ==="
 echo ""
 
@@ -211,6 +248,7 @@ echo ""
 # clock display and session-reset chime. All re-read by the daemon each poll.
 echo "[4/6] Configuring the daemon..."
 configure_config_dirs
+configure_prompt_hook
 configure_clock
 configure_chime
 echo ""

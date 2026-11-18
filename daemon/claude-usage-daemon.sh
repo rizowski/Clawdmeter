@@ -44,6 +44,62 @@ declare -A LAST_ACTIVE  # poll-sequence number of the last observed rise (0 = ne
 POLL_SEQ=0              # monotonic poll counter — recency ordering that's immune to
                         # wall-clock resolution and NTP steps (polls are 60s apart, but
                         # a counter is unambiguous even if two land in the same second)
+CURRENT_DIR=""          # the dir poll() last sent
+# Written by daemon/clawdmeter-prompt-hook (a Claude Code UserPromptSubmit hook):
+# the config dir of the most recent prompt. When it names a configured dir, that
+# plan is shown, ahead of the usage-rise guess.
+LAST_PROMPT_FILE="$HOME/.config/claude-usage-monitor/last-prompt"
+LAST_PROMPT_SEEN=""     # mtime of LAST_PROMPT_FILE when last checked
+
+_last_prompt_mtime() {
+    # GNU stat first (ns resolution); BSD stat keeps the tests runnable on macOS.
+    stat -c %y "$LAST_PROMPT_FILE" 2>/dev/null || stat -f %m "$LAST_PROMPT_FILE" 2>/dev/null
+}
+
+# The config dir of the last prompt (first line of LAST_PROMPT_FILE), or empty.
+read_last_prompt_dir() {
+    local d
+    d=$(head -n 1 "$LAST_PROMPT_FILE" 2>/dev/null | tr -d '\r')
+    case "$d" in
+        "~")   d="$HOME" ;;
+        "~/"*) d="$HOME/${d#\~/}" ;;
+    esac
+    echo "$d"
+}
+
+# True when two paths name the same dir (symlinks, trailing slashes tolerated).
+_same_dir() {
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    local a b
+    a=$(realpath -m "$1" 2>/dev/null || echo "${1%/}")
+    b=$(realpath -m "$2" 2>/dev/null || echo "${2%/}")
+    [ "$a" = "$b" ]
+}
+
+PROMPT_SWITCH=0         # 1 = a prompt landed in another plan; poll soon
+
+# Called every tick. When a new prompt lands in a plan other than the one shown,
+# set PROMPT_SWITCH so the main loop polls early (at most once per
+# REFRESH_MIN_GAP). A prompt in the plan already shown costs no API call.
+prompt_switch_check() {
+    local m d
+    m=$(_last_prompt_mtime)
+    if [ -z "$m" ] || [ "$m" = "$LAST_PROMPT_SEEN" ]; then
+        return 0
+    fi
+    LAST_PROMPT_SEEN="$m"
+    [ "$(read_config_dirs | wc -l)" -gt 1 ] || return 0
+    d=$(read_last_prompt_dir)
+    if [ -n "$d" ] && ! _same_dir "$d" "$CURRENT_DIR"; then
+        log "Prompt in another plan; switching"
+        PROMPT_SWITCH=1
+    fi
+}
+
+# True when a pending prompt switch may poll now ($1 = seconds since last poll).
+prompt_switch_due() {
+    [ "$PROMPT_SWITCH" = 1 ] && (( $1 >= REFRESH_MIN_GAP ))
+}
 
 # Read the `config_dirs` option: a comma-separated list of Claude config dirs.
 # Defaults to "~/.claude" so existing single-plan setups are unchanged. Tildes
@@ -379,7 +435,9 @@ send_payload() {
 mqtt_tick() {
     local now="$1"
     local since=$(( now - LAST_POLL ))
-    if (( since >= POLL_INTERVAL )) || { [ -f "$REFRESH_FLAG" ] && (( since >= REFRESH_MIN_GAP )); }; then
+    if (( since >= POLL_INTERVAL )) || { [ -f "$REFRESH_FLAG" ] && (( since >= REFRESH_MIN_GAP )); } \
+            || prompt_switch_due "$since"; then
+        PROMPT_SWITCH=0
         if [ -f "$REFRESH_FLAG" ]; then
             log "Refresh requested by device"
             rm -f "$REFRESH_FLAG"
@@ -548,22 +606,41 @@ poll() {
         return 1
     fi
 
-    # Pick the active dir: most recent activity wins; ties (and the no-activity
-    # startup case) broken by highest current session %.
-    local best_dir="" best_active=-1 best_s=-1 a
-    for dir in "${!cycle_payload[@]}"; do
-        a=${LAST_ACTIVE[$dir]:-0}
-        s=${cycle_s[$dir]}
-        if (( a > best_active )) || (( a == best_active && s > best_s )); then
-            best_active=$a; best_s=$s; best_dir=$dir
-        fi
-    done
-
-    if [ ${#dirs[@]} -gt 1 ]; then
-        log "Active plan: $best_dir (s=$best_s)"
+    # Pick the active dir. The dir of the last prompt wins when the hook reported
+    # one and it has a payload this cycle. Otherwise most recent activity wins;
+    # ties (and the no-activity startup case) broken by highest current session %.
+    local best_dir="" best_active=-1 best_s=-1 a reason="usage" prompted=""
+    [ ${#dirs[@]} -gt 1 ] && prompted=$(read_last_prompt_dir)
+    if [ -n "$prompted" ]; then
+        for dir in "${!cycle_payload[@]}"; do
+            if _same_dir "$dir" "$prompted"; then
+                best_dir=$dir; best_s=${cycle_s[$dir]}; reason="last prompt"
+                break
+            fi
+        done
     fi
-    log "Sending: ${cycle_payload[$best_dir]}"
-    send_payload "${cycle_payload[$best_dir]}" || { log "Send failed"; return 1; }
+    if [ -z "$best_dir" ]; then
+        for dir in "${!cycle_payload[@]}"; do
+            a=${LAST_ACTIVE[$dir]:-0}
+            s=${cycle_s[$dir]}
+            if (( a > best_active )) || (( a == best_active && s > best_s )); then
+                best_active=$a; best_s=$s; best_dir=$dir
+            fi
+        done
+    fi
+
+    payload="${cycle_payload[$best_dir]}"
+    if [ ${#dirs[@]} -gt 1 ]; then
+        log "Active plan: $best_dir (s=$best_s, by $reason)"
+        if [ -n "$CURRENT_DIR" ] && ! _same_dir "$CURRENT_DIR" "$best_dir"; then
+            # A plan switch drops the shown session %, which the firmware reads
+            # as a session reset. Don't let that sound a false chime.
+            payload="${payload/,\"c\":1/}"
+        fi
+    fi
+    CURRENT_DIR="$best_dir"
+    log "Sending: $payload"
+    send_payload "$payload" || { log "Send failed"; return 1; }
     return 0
 }
 
@@ -578,6 +655,7 @@ trap cleanup INT TERM
 
 log "=== Claude Usage Tracker Daemon ==="
 log "Poll interval: ${POLL_INTERVAL}s"
+LAST_PROMPT_SEEN=$(_last_prompt_mtime)   # prompts before startup are not "new"
 
 if [ -f "$BROKER_DIR/broker.env" ]; then
     # shellcheck disable=SC1091
@@ -595,6 +673,7 @@ if [ "$TRANSPORT" = mqtt ]; then
     while true; do
         side_services_tick
         refresh_sub_ensure
+        prompt_switch_check
         mqtt_tick "$(date +%s)"
         sleep "$TICK"
     done
@@ -644,8 +723,11 @@ while true; do
     LAST_POLL=0
     while is_connected; do
         side_services_tick
+        prompt_switch_check
         NOW=$(date +%s)
-        if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
+        if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )) \
+                || prompt_switch_due $(( NOW - LAST_POLL )); then
+            PROMPT_SWITCH=0
             if [ -f "$REFRESH_FLAG" ]; then
                 log "Refresh requested by device"
                 rm -f "$REFRESH_FLAG"

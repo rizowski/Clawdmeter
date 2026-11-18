@@ -13,6 +13,7 @@ import asyncio
 import calendar
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -50,6 +51,10 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 DEFAULT_CONFIG_DIR = Path.home() / ".claude"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
+# Written by daemon/clawdmeter-prompt-hook (a Claude Code UserPromptSubmit
+# hook): the config dir of the most recent prompt. Overrides the usage-rise
+# guess in PlanSelector when it names a configured dir.
+LAST_PROMPT_FILE = CONFIG_FILE.parent / "last-prompt"
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -127,11 +132,24 @@ def _decode_keychain_blob(raw: str) -> str:
     return raw
 
 
-def _read_token_keychain() -> str | None:
-    """Read the OAuth access token from the macOS Keychain, or None.
+def keychain_service_for(config_dir: Path) -> str:
+    """The Keychain service Claude Code stores a config dir's token under.
+
+    The default dir uses the bare name. A dir selected with CLAUDE_CONFIG_DIR
+    gets "<name>-<first 8 hex of sha256(dir path)>".
+    """
+    if config_dir == DEFAULT_CONFIG_DIR:
+        return KEYCHAIN_SERVICE
+    digest = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    return f"{KEYCHAIN_SERVICE}-{digest}"
+
+
+def _read_keychain_blob(service: str = KEYCHAIN_SERVICE, quiet: bool = False) -> str | None:
+    """Read one Keychain entry's credentials blob (decoded text), or None.
 
     ``security … -w`` may hex-dump the stored secret (see _decode_keychain_blob),
-    so decode before extracting the access token.
+    so decode it here. ``quiet`` drops the failure logs, for callers whose
+    result is optional.
     """
     try:
         out = subprocess.run(
@@ -139,7 +157,7 @@ def _read_token_keychain() -> str | None:
                 "security",
                 "find-generic-password",
                 "-s",
-                KEYCHAIN_SERVICE,
+                service,
                 "-a",
                 getpass.getuser(),
                 "-w",
@@ -150,12 +168,44 @@ def _read_token_keychain() -> str | None:
             timeout=10,
         )
     except subprocess.CalledProcessError as e:
-        log(f"Keychain read failed (rc={e.returncode}): {e.stderr.strip()}")
+        if not quiet:
+            log(f"Keychain read failed (rc={e.returncode}): {e.stderr.strip()}")
         return None
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f"Keychain access error: {e}")
+        if not quiet:
+            log(f"Keychain access error: {e}")
         return None
-    return _extract_access_token(_decode_keychain_blob(out.stdout))
+    return _decode_keychain_blob(out.stdout)
+
+
+def _read_token_keychain(service: str = KEYCHAIN_SERVICE) -> str | None:
+    """Read the OAuth access token from the macOS Keychain, or None."""
+    blob = _read_keychain_blob(service)
+    return _extract_access_token(blob) if blob else None
+
+
+# Plan names shown as the device's title. Claude Code records the plan as
+# `subscriptionType` next to the token; unknown values are shown title-cased.
+PLAN_NAMES = {"max": "Max", "pro": "Pro", "team": "Team", "enterprise": "Enterprise"}
+PLAN_NAME_MAX = 11   # the firmware's UsageData.plan holds 11 characters
+
+
+def _extract_plan_name(blob: str) -> str:
+    """The display name of the plan in a credentials blob, or "" if absent."""
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for v in [data, *data.values()]:
+        if isinstance(v, dict):
+            sub = v.get("subscriptionType")
+            if isinstance(sub, str) and sub.strip():
+                sub = sub.strip()
+                name = PLAN_NAMES.get(sub.lower(), sub.replace("_", " ").title())
+                return name[:PLAN_NAME_MAX]
+    return ""
 
 
 def read_config_dirs() -> list[Path]:
@@ -185,12 +235,9 @@ def read_config_dirs() -> list[Path]:
 def read_token_for(config_dir: Path) -> str | None:
     """Read the OAuth token for one config dir.
 
-    Linux: each dir keeps its own ``<dir>/.credentials.json``. macOS: the default
-    install stores the token in Keychain with no file, so for the default dir we
-    fall back to Keychain when no file is present — preserving existing
-    single-plan macOS behavior. Additional macOS dirs are read from their files;
-    a work plan whose token lives only in the single Keychain entry can't be told
-    apart there (documented follow-up).
+    Linux: each dir keeps its own ``<dir>/.credentials.json``. macOS: Claude
+    Code stores the token in Keychain with no file, so when no file is present
+    we read that dir's Keychain entry (see keychain_service_for).
     """
     cred = config_dir / ".credentials.json"
     try:
@@ -198,9 +245,28 @@ def read_token_for(config_dir: Path) -> str | None:
             return _extract_access_token(cred.read_text())
     except OSError as e:
         log(f"Error reading credentials in {config_dir}: {e}")
-    if sys.platform == "darwin" and config_dir == DEFAULT_CONFIG_DIR:
-        return _read_token_keychain()
+    if sys.platform == "darwin":
+        return _read_token_keychain(keychain_service_for(config_dir))
     return None
+
+
+def read_plan_for(config_dir: Path) -> str:
+    """The plan name ("Max", "Team", …) of one config dir, or "" if unknown.
+
+    Read from the same place as the token (see read_token_for). Never raises
+    and never logs: the name is optional, the device falls back to its clock
+    or "Usage" title without it.
+    """
+    cred = config_dir / ".credentials.json"
+    try:
+        if cred.exists():
+            return _extract_plan_name(cred.read_text())
+    except OSError:
+        return ""
+    if sys.platform == "darwin":
+        blob = _read_keychain_blob(keychain_service_for(config_dir), quiet=True)
+        return _extract_plan_name(blob) if blob else ""
+    return ""
 
 
 def load_cached_address() -> str | None:
@@ -450,7 +516,17 @@ async def poll_api(token: str) -> dict | None:
     if resp.status_code in (401, 403):
         log(f"API HTTP {resp.status_code} (token expired/invalid)")
         raise TokenExpired()
-    if resp.status_code >= 400:
+    # A plan at its limit answers 429, but the 429 still carries the usage
+    # headers. Read them, or a full plan has no payload and the device shows
+    # another plan (or stale numbers) until the window resets.
+    has_usage = any(
+        resp.headers.get(h)
+        for h in (
+            "anthropic-ratelimit-unified-5h-utilization",
+            "anthropic-ratelimit-unified-overage-utilization",
+        )
+    )
+    if resp.status_code >= 400 and not (resp.status_code == 429 and has_usage):
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
 
@@ -469,7 +545,7 @@ async def poll_api(token: str) -> dict | None:
 
     def pct(util: str) -> int:
         try:
-            return int(round(float(util) * 100))
+            return min(100, int(round(float(util) * 100)))   # 429s report > 1.0
         except ValueError:
             return 0
 
@@ -543,29 +619,102 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
     }
 
 
+def _same_dir(a: Path, b: Path) -> bool:
+    """True when two config-dir paths name the same directory (~, symlinks,
+    trailing slashes and missing dirs all tolerated)."""
+    try:
+        return a.expanduser().resolve() == b.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return a.expanduser() == b.expanduser()
+
+
+def read_last_prompt_dir() -> Path | None:
+    """The config dir of the last Claude Code prompt, from LAST_PROMPT_FILE.
+
+    None when the hook is not installed (no file) or the file is empty.
+    """
+    try:
+        lines = LAST_PROMPT_FILE.read_text().strip().splitlines()
+    except OSError:
+        return None
+    if not lines or not lines[0].strip():
+        return None
+    return Path(lines[0].strip()).expanduser()
+
+
+def last_prompt_mtime() -> int | None:
+    """LAST_PROMPT_FILE's mtime in ns, or None when it does not exist."""
+    try:
+        return LAST_PROMPT_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
 class PlanSelector:
     """Decide which config dir's plan is "active" across polls.
 
-    "Active" = the plan whose session % rose most recently (recent API activity).
-    A rise stamps a monotonic poll counter, so the choice is sticky and a window
-    reset (a drop to 0) isn't mistaken for use. Before any rise is seen (startup)
-    the highest current session % wins. Mirrors the Linux bash daemon.
+    1. The dir of the last Claude Code prompt wins, when the prompt hook
+       reported one (see read_last_prompt_dir) and that dir has a payload.
+    2. Otherwise, the plan whose session % rose most recently (recent API
+       activity). A rise stamps a monotonic poll counter, so the choice is
+       sticky and a window reset (a drop to 0) isn't mistaken for use.
+    3. Before any rise is seen (startup) the highest current session % wins.
+
+    Mirrors the Linux bash daemon.
     """
 
     def __init__(self) -> None:
         self.prev_s: dict[Path, int] = {}
         self.last_active: dict[Path, int] = {}
         self.seq = 0
+        self.current: Path | None = None   # the dir the last choose() returned
+        self.reason = ""                   # "last prompt" or "usage" (for logs)
 
-    def choose(self, sessions: dict[Path, int]) -> Path:
+    def choose(self, sessions: dict[Path, int], prompted: Path | None = None) -> Path:
         """Update state from this cycle's {dir: session_pct} and return the active dir."""
         self.seq += 1
         for d, s in sessions.items():
             if d in self.prev_s and s > self.prev_s[d]:
                 self.last_active[d] = self.seq
             self.prev_s[d] = s
-        # Most recent activity wins; ties (and the startup case) break by highest %.
-        return max(sessions, key=lambda d: (self.last_active.get(d, 0), sessions[d]))
+        chosen = None
+        if prompted is not None:
+            chosen = next((d for d in sessions if _same_dir(d, prompted)), None)
+        if chosen is not None:
+            self.reason = "last prompt"
+        else:
+            # Most recent activity wins; ties (and the startup case) break by highest %.
+            chosen = max(sessions, key=lambda d: (self.last_active.get(d, 0), sessions[d]))
+            self.reason = "usage"
+        self.current = chosen
+        return chosen
+
+    def is_current(self, d: Path) -> bool:
+        return self.current is not None and _same_dir(self.current, d)
+
+
+class PromptWatcher:
+    """Notice when a new prompt lands in a plan other than the one shown.
+
+    The hook rewrites LAST_PROMPT_FILE on every prompt. The main loops call
+    switch_pending() each tick and poll early when it is True, so the device
+    follows a plan switch in seconds instead of waiting for POLL_INTERVAL.
+    A prompt in the plan already shown costs no API call.
+    """
+
+    def __init__(self, selector: PlanSelector) -> None:
+        self.selector = selector
+        self.seen = last_prompt_mtime()   # prompts before startup are not "new"
+
+    def switch_pending(self) -> bool:
+        mtime = last_prompt_mtime()
+        if mtime is None or mtime == self.seen:
+            return False
+        self.seen = mtime
+        if len(read_config_dirs()) < 2:
+            return False
+        d = read_last_prompt_dir()
+        return d is not None and not self.selector.is_current(d)
 
 
 # Module-level so the active-plan state survives reconnects.
@@ -609,10 +758,19 @@ async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, 
             sessions[d] = int(payload.get("s", 0) or 0)
     if not payloads:
         return None, not any_live
-    active = selector.choose(sessions)
+    previous = selector.current
+    active = selector.choose(sessions, read_last_prompt_dir() if len(dirs) > 1 else None)
+    payload = payloads[active]
+    plan = read_plan_for(active)
+    if plan:
+        payload = {**payload, "pl": plan}   # the device shows it as the title
     if len(dirs) > 1:
-        log(f"Active plan: {active} (s={sessions[active]})")
-    return payloads[active], False
+        log(f"Active plan: {active} (s={sessions[active]}, by {selector.reason})")
+        if previous is not None and not _same_dir(previous, active):
+            # A plan switch drops the shown session %, which the firmware reads
+            # as a session reset. Don't let that sound a false chime.
+            payload = {k: v for k, v in payload.items() if k != "c"}
+    return payload, False
 
 
 async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None:
@@ -787,12 +945,19 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
 
     last_poll = 0.0
     used_successfully = False
+    watcher = PromptWatcher(_SELECTOR)
+    prompt_switch = False
     try:
         while client.is_connected and not stop_event.is_set():
+            if watcher.switch_pending():
+                log("Prompt in another plan; switching")
+                prompt_switch = True
             now = time.time()
             elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
+            if (session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL
+                    or (prompt_switch and elapsed >= REFRESH_MIN_GAP)):
                 session.refresh_requested.clear()
+                prompt_switch = False
                 # Pure free-ride: read whatever access token(s) Claude Code
                 # currently holds across the configured config dirs and NEVER
                 # refresh them ourselves. Claude Code (the token's owner) does all
@@ -901,8 +1066,12 @@ async def run_mqtt(env: dict, stop_event: asyncio.Event, ble: "OpportunisticBle 
     pub = mqtt_transport.Publisher(env, asyncio.get_running_loop(), _on_refresh, log)
     pub.start()
     last_poll = 0.0
+    watcher = PromptWatcher(_SELECTOR)
     try:
         while not stop_event.is_set():
+            if watcher.switch_pending():
+                log("Prompt in another plan; switching")
+                refresh.set()   # same REFRESH_MIN_GAP floor as a device refresh
             since = time.time() - last_poll
             if since >= POLL_INTERVAL or (refresh.is_set() and since >= REFRESH_MIN_GAP):
                 refresh.clear()
